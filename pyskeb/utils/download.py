@@ -29,7 +29,10 @@ def download_file(url, filename=None, output_directory=None,
     response = srequest(session, 'GET', url, stream=True, allow_redirects=True, **kwargs)
     expected_size = expected_size or response.headers.get('Content-Length', None)
     if filename is None:
-        filename = pyrfc6266.parse_filename(response.headers.get('Content-Disposition'))
+        diso = response.headers.get('Content-Disposition')
+        if not diso:
+            raise RuntimeError('Filename not given, and it cannot be determined in the response headers.')
+        filename = pyrfc6266.parse_filename(diso)
     if output_directory is not None:
         filename = os.path.join(output_directory, filename)
     expected_size = int(expected_size) if expected_size is not None else expected_size
