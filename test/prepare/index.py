@@ -145,7 +145,7 @@ def sync(src_repo: str, dst_repo: str):
                 print(f'# Index Archives', file=f)
                 print(f'', file=f)
                 current_time = datetime.datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')
-                print(f'{plural_word(len(df), "file")} in total. Last updated at `{current_time}.', file=f)
+                print(f'{plural_word(len(df), "file")} in total. Last updated at `{current_time}`.', file=f)
                 print(f'', file=f)
 
                 df_hqimage = df[df['group'] == 'hqimage'][
