@@ -1,6 +1,7 @@
 import datetime
 import mimetypes
 import os
+import re
 
 import magic
 import numpy as np
@@ -85,7 +86,8 @@ def sync(src_repo: str, dst_repo: str):
                     for file in files:
                         filepath = os.path.abspath(os.path.join(root, file))
                         relpath = os.path.relpath(filepath, os.path.abspath(tmpdir))
-                        group_name = os.path.dirname(relpath)
+                        segments = list(filter(bool, re.split(r'[\\/]+', relpath)))
+                        group_name = segments[0]
                         mimetype, _ = mimetypes.guess_type(relpath)
                         _, ext = os.path.splitext(relpath)
                         if not mimetype:
