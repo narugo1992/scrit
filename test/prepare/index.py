@@ -2,6 +2,7 @@ import datetime
 import mimetypes
 import os
 
+import magic
 import numpy as np
 import pandas as pd
 from PIL import Image
@@ -85,15 +86,20 @@ def sync(src_repo: str, dst_repo: str):
                         relpath = os.path.relpath(filepath, os.path.abspath(tmpdir))
                         group_name = os.path.dirname(relpath)
                         mimetype, _ = mimetypes.guess_type(relpath)
-                        max_id += 1
                         _, ext = os.path.splitext(relpath)
-                        filename = f'{max_id}{ext.lower()}'
+                        if not mimetype:
+                            mime = magic.Magic(mime=True)
+                            mimetype = mime.from_file(filepath)
+                            ext = mimetypes.guess_extension(mimetype)
+
                         if mimetype and mimetype.startswith('image/'):
                             image = Image.open(filepath)
                             width, height = image.width, image.height
                         else:
                             width, height = None, None
+                        filename = f'{max_id}{(ext or "").lower()}'
 
+                        max_id += 1
                         rows.append({
                             'id': max_id,
                             'pack_id': pack_id,

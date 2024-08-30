@@ -21,3 +21,4 @@ tzlocal
 pyarrow
 cryptography
 pyyaml>=6
+python-magic
