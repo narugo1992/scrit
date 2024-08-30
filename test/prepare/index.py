@@ -98,7 +98,7 @@ def sync(src_repo: str, dst_repo: str):
                             'id': max_id,
                             'pack_id': pack_id,
                             'archive_file': os.path.relpath(tar_file, td),
-                            'file_in_archive': filepath,
+                            'file_in_archive': relpath,
                             'group': group_name,
                             'filename': filename,
                             'mimetype': mimetype,
