@@ -75,7 +75,7 @@ def sync(src_repo: str, dst_repo: str):
                 )
 
                 logging.info('Packing archive ...')
-                archive_pack('tar', tmpdir, tar_file, clear=True)
+                archive_pack('tar', tmpdir, tar_file)
                 tar_create_index_for_directory(src_tar_directory=td)
 
                 new_row_count = 0
