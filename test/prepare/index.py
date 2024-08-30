@@ -16,6 +16,7 @@ from hfutils.utils import parse_hf_fs_path, number_to_tag
 from tqdm import tqdm
 
 mimetypes.add_type('image/webp', '.webp')
+Image.MAX_IMAGE_PIXELS = None
 
 
 def sync(src_repo: str, dst_repo: str):
