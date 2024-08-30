@@ -144,7 +144,7 @@ def sync(src_repo: str, dst_repo: str):
                 print(f'{plural_word(len(df), "file")} in total. Last updated at `{current_time}.', file=f)
                 print(f'', file=f)
 
-                df_hqimage = df[df['group'] == 'hqimage'][
+                df_hqimage = df[df['group'] == 'hqimage'][:50][
                     ['id', 'group', 'filename', 'mimetype', 'file_size', 'width', 'height', 'archive_file',
                      'file_in_archive']
                 ]
@@ -154,7 +154,7 @@ def sync(src_repo: str, dst_repo: str):
                 print(f'', file=f)
 
                 for group_name in sorted(set(df['group']) - {'hqimage'}):
-                    df_group = df[df['group'] == group_name][
+                    df_group = df[df['group'] == group_name][:50][
                         ['id', 'group', 'filename', 'mimetype', 'file_size', 'archive_file', 'file_in_archive']
                     ]
                     print(f'{plural_word(len(df_group), "file")} with `{group_name}` group.', file=f)
