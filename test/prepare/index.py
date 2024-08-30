@@ -3,6 +3,7 @@ import json
 import mimetypes
 import os
 import re
+import time
 
 import magic
 import numpy as np
@@ -21,7 +22,8 @@ mimetypes.add_type('image/webp', '.webp')
 Image.MAX_IMAGE_PIXELS = None
 
 
-def sync(src_repo: str, dst_repo: str):
+def sync(src_repo: str, dst_repo: str, max_time_limit: float = 5.5 * 60 * 60):
+    start_time = time.time()
     hf_client = get_hf_client()
     hf_fs = get_hf_fs()
 
@@ -61,6 +63,8 @@ def sync(src_repo: str, dst_repo: str):
         max_id = 0
 
     for pack_id in tqdm(src_ids, desc='Sync Packs'):
+        if start_time + max_time_limit < time.time():
+            break
         if pack_id in dst_ids:
             logging.warning(f'Package {pack_id!r} already synced, skipped.')
             continue
@@ -183,5 +187,6 @@ if __name__ == '__main__':
     logging.try_init_root(level=logging.INFO)
     sync(
         src_repo=os.environ['REMOTE_REPOSITORY_ORD'],
-        dst_repo=os.environ['REMOTE_REPOSITORY_ORD_IDX']
+        dst_repo=os.environ['REMOTE_REPOSITORY_ORD_IDX'],
+        max_time_limit=5.5 * 60 * 60,
     )
