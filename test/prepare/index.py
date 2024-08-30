@@ -44,7 +44,7 @@ def sync(src_repo: str, dst_repo: str):
 
     dst_tar_files = [
         os.path.basename(parse_hf_fs_path(file).filename)
-        for file in hf_fs.glob(f'datasets/{src_repo}/packs/*.tar')
+        for file in hf_fs.glob(f'datasets/{dst_repo}/packs/*.tar')
     ]
     dst_ids = set([os.path.splitext(file)[0] for file in dst_tar_files])
 
