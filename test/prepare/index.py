@@ -1,4 +1,5 @@
 import datetime
+import json
 import mimetypes
 import os
 import re
@@ -82,40 +83,41 @@ def sync(src_repo: str, dst_repo: str):
                 tar_create_index_for_directory(src_tar_directory=td)
 
                 new_row_count = 0
-                for root, _, files in os.walk(tmpdir):
-                    for file in files:
-                        filepath = os.path.abspath(os.path.join(root, file))
-                        relpath = os.path.relpath(filepath, os.path.abspath(tmpdir))
-                        segments = list(filter(bool, re.split(r'[\\/]+', relpath)))
-                        group_name = segments[0]
-                        mimetype, _ = mimetypes.guess_type(relpath)
-                        _, ext = os.path.splitext(relpath)
-                        if not mimetype:
-                            mime = magic.Magic(mime=True)
-                            mimetype = mime.from_file(filepath)
-                            ext = mimetypes.guess_extension(mimetype)
+                idx_file = os.path.splitext(tar_file)[0] + '.json'
+                with open(idx_file, 'r') as mf:
+                    meta = json.load(mf)
+                for file_in_archive in meta['files'].keys():
+                    filepath = os.path.join(tmpdir, file_in_archive)
+                    segments = list(filter(bool, re.split(r'[\\/]+', file_in_archive)))
+                    group_name = segments[0]
+                    mimetype, _ = mimetypes.guess_type(file_in_archive)
+                    _, ext = os.path.splitext(file_in_archive)
+                    if not mimetype:
+                        mime = magic.Magic(mime=True)
+                        mimetype = mime.from_file(filepath)
+                        ext = mimetypes.guess_extension(mimetype)
 
-                        if mimetype and mimetype.startswith('image/'):
-                            image = Image.open(filepath)
-                            width, height = image.width, image.height
-                        else:
-                            width, height = None, None
-                        filename = f'{max_id}{(ext or "").lower()}'
+                    if mimetype and mimetype.startswith('image/'):
+                        image = Image.open(filepath)
+                        width, height = image.width, image.height
+                    else:
+                        width, height = None, None
+                    filename = f'{max_id}{(ext or "").lower()}'
 
-                        max_id += 1
-                        rows.append({
-                            'id': max_id,
-                            'pack_id': pack_id,
-                            'archive_file': os.path.relpath(tar_file, td),
-                            'file_in_archive': relpath,
-                            'group': group_name,
-                            'filename': filename,
-                            'mimetype': mimetype,
-                            'file_size': os.path.getsize(filepath),
-                            'width': width,
-                            'height': height,
-                        })
-                        new_row_count += 1
+                    max_id += 1
+                    rows.append({
+                        'id': max_id,
+                        'pack_id': pack_id,
+                        'archive_file': os.path.relpath(tar_file, td),
+                        'file_in_archive': file_in_archive,
+                        'group': group_name,
+                        'filename': filename,
+                        'mimetype': mimetype,
+                        'file_size': os.path.getsize(filepath),
+                        'width': width,
+                        'height': height,
+                    })
+                    new_row_count += 1
 
             df = pd.DataFrame(rows)
             df = df.sort_values(by=['id'], ascending=[False])
