@@ -7,7 +7,7 @@ import re
 import magic
 import numpy as np
 import pandas as pd
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from ditk import logging
 from hbutils.string import plural_word
 from hbutils.system import TemporaryDirectory
@@ -98,8 +98,12 @@ def sync(src_repo: str, dst_repo: str):
                         ext = mimetypes.guess_extension(mimetype)
 
                     if mimetype and mimetype.startswith('image/'):
-                        image = Image.open(filepath)
-                        width, height = image.width, image.height
+                        try:
+                            image = Image.open(filepath)
+                        except UnidentifiedImageError:
+                            width, height = None, None
+                        else:
+                            width, height = image.width, image.height
                     else:
                         width, height = None, None
                     filename = f'{max_id}{(ext or "").lower()}'
