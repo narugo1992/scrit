@@ -132,7 +132,7 @@ def sync(src_repo: str, dst_repo: str):
                 print('- text-to-image', file=f)
                 print('language:', file=f)
                 print('- en', file=f)
-                print('- jp', file=f)
+                print('- ja', file=f)
                 print('tags:', file=f)
                 print('- art', file=f)
                 print('- anime', file=f)
