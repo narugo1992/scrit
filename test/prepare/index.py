@@ -88,7 +88,7 @@ def sync(src_repo: str, dst_repo: str):
                         max_id += 1
                         _, ext = os.path.splitext(relpath)
                         filename = f'{max_id}{ext.lower()}'
-                        if mimetype.startswith('image/'):
+                        if mimetype and mimetype.startswith('image/'):
                             image = Image.open(filepath)
                             width, height = image.width, image.height
                         else:
