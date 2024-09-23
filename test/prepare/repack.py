@@ -4,12 +4,14 @@ import os.path
 import zipfile
 from contextlib import contextmanager
 from datetime import datetime
+from typing import Optional
 
 import pandas as pd
 from hbutils.scale import size_to_bytes_str
 from hbutils.system import TemporaryDirectory
 from huggingface_hub import CommitOperationAdd, CommitOperationDelete
 from huggingface_hub import hf_hub_url
+from huggingface_hub.hf_api import RepoFile
 from huggingface_hub.utils import HfHubHTTPError
 from tqdm.auto import tqdm
 
@@ -18,16 +20,26 @@ from .base import _REPOSITORY, hf_client, hf_fs, _ensure_repository
 
 
 @contextmanager
-def repack_zips():
+def repack_zips(max_size_limit: Optional[float] = None):
     with TemporaryDirectory() as td:
         dd_dir = os.path.join(td, 'origin')
         os.makedirs(dd_dir, exist_ok=True)
 
         fns = []
+        current_size = 0
         for file in tqdm(hf_fs.glob(f'datasets/{_REPOSITORY}/unarchived/*.zip')):
             filename = os.path.basename(file)
-            fns.append(filename)
+            file_item: RepoFile = list(hf_client.get_paths_info(
+                repo_id=_REPOSITORY,
+                repo_type='dataset',
+                paths=[f'unarchived/{filename}'],
+                expand=True,
+            ))[0]
+            if current_size + file_item.size >= max_size_limit:
+                break
 
+            current_size += file_item.size
+            fns.append(filename)
             with TemporaryDirectory() as ctd:
                 zip_file = os.path.join(ctd, filename)
                 download_file(
@@ -82,7 +94,7 @@ def repack_all():
     else:
         archived_resource_ids = []
 
-    with repack_zips() as (zip_file, fns):
+    with repack_zips(max_size_limit=5.5 * 1024 ** 3) as (zip_file, fns):
         if zip_file is None:
             logging.info('No files to repack, skipped.')
             return
