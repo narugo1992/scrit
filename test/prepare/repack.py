@@ -29,14 +29,17 @@ def repack_zips(max_size_limit: Optional[float] = None):
         current_size = 0
         for file in tqdm(hf_fs.glob(f'datasets/{_REPOSITORY}/unarchived/*.zip')):
             filename = os.path.basename(file)
+            if max_size_limit is not None and current_size >= max(max_size_limit * 0.95, max_size_limit - 100):
+                break
+
             file_item: RepoFile = list(hf_client.get_paths_info(
                 repo_id=_REPOSITORY,
                 repo_type='dataset',
                 paths=[f'unarchived/{filename}'],
                 expand=True,
             ))[0]
-            if current_size + file_item.size >= max_size_limit:
-                break
+            if max_size_limit is not None and current_size + file_item.size >= max_size_limit:
+                continue
 
             current_size += file_item.size
             fns.append(filename)
