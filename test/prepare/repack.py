@@ -41,20 +41,25 @@ def repack_zips(max_size_limit: Optional[float] = None):
             if max_size_limit is not None and current_size + file_item.size >= max_size_limit:
                 continue
 
-            current_size += file_item.size
-            fns.append(filename)
-            with TemporaryDirectory() as ctd:
-                zip_file = os.path.join(ctd, filename)
-                download_file(
-                    hf_hub_url(repo_id=_REPOSITORY, repo_type='dataset', filename=f'unarchived/{filename}'),
-                    zip_file,
-                    headers={'Authorization': f'Bearer {os.environ["HF_TOKEN"]}'},
-                )
-                with zipfile.ZipFile(zip_file, 'r') as zf:
-                    try:
-                        zf.extractall(dd_dir)
-                    except OSError as err:
-                        logging.warning(repr(err))
+            try:
+                with TemporaryDirectory() as ctd:
+                    zip_file = os.path.join(ctd, filename)
+                    download_file(
+                        hf_hub_url(repo_id=_REPOSITORY, repo_type='dataset', filename=f'unarchived/{filename}'),
+                        zip_file,
+                        headers={'Authorization': f'Bearer {os.environ["HF_TOKEN"]}'},
+                    )
+                    with zipfile.ZipFile(zip_file, 'r') as zf:
+                        try:
+                            zf.extractall(dd_dir)
+                        except OSError as err:
+                            logging.warning(repr(err))
+            except:
+                logging.exception(f'Error when extracting file {filename!r}, skipped.')
+                continue
+            else:
+                current_size += file_item.size
+                fns.append(filename)
 
         zip_file = os.path.join(td, 'package.zip')
         written = False
