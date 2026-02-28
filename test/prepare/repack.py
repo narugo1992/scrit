@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import os.path
 import zipfile
 from contextlib import contextmanager
@@ -10,13 +11,15 @@ import pandas as pd
 from hbutils.scale import size_to_bytes_str
 from hbutils.system import TemporaryDirectory
 from huggingface_hub import CommitOperationAdd, CommitOperationDelete
-from huggingface_hub import hf_hub_url
+from huggingface_hub import hf_hub_url, hf_hub_download
 from huggingface_hub.hf_api import RepoFile
 from huggingface_hub.utils import HfHubHTTPError
 from tqdm.auto import tqdm
-
+from hfutils.operate import hf_repo_glob, download_file_to_file
 from pyskeb.utils.download import download_file
-from .base import _REPOSITORY, hf_client, hf_fs, _ensure_repository
+from .base import _REPOSITORY, hf_client, _ensure_repository
+
+hf_token = os.environ.get('HF_TOKEN')
 
 
 @contextmanager
@@ -27,17 +30,20 @@ def repack_zips(max_size_limit: Optional[float] = None):
 
         fns = []
         current_size = 0
-        for file in tqdm(hf_fs.glob(f'datasets/{_REPOSITORY}/unarchived/*.zip')):
-            filename = os.path.basename(file)
+
+        # Use hf_repo_glob instead of hf_fs.glob
+        zip_files = hf_repo_glob(
+            repo_id=_REPOSITORY,
+            pattern='unarchived/*.zip',
+            repo_type='dataset',
+            hf_token=hf_token
+        )
+
+        for file_item in tqdm(zip_files):
+            filename = os.path.basename(file_item.path)
             if max_size_limit is not None and current_size >= max(max_size_limit * 0.95, max_size_limit - 100):
                 break
 
-            file_item: RepoFile = list(hf_client.get_paths_info(
-                repo_id=_REPOSITORY,
-                repo_type='dataset',
-                paths=[f'unarchived/{filename}'],
-                expand=True,
-            ))[0]
             if max_size_limit is not None and current_size + file_item.size >= max_size_limit:
                 continue
 
@@ -47,7 +53,7 @@ def repack_zips(max_size_limit: Optional[float] = None):
                     download_file(
                         hf_hub_url(repo_id=_REPOSITORY, repo_type='dataset', filename=f'unarchived/{filename}'),
                         zip_file,
-                        headers={'Authorization': f'Bearer {os.environ["HF_TOKEN"]}'},
+                        headers={'Authorization': f'Bearer {hf_token}'},
                     )
                     with zipfile.ZipFile(zip_file, 'r') as zf:
                         try:
@@ -79,16 +85,38 @@ def repack_zips(max_size_limit: Optional[float] = None):
 
 
 def _make_records():
-    if not hf_fs.exists(f'datasets/{_REPOSITORY}/index.json'):
+    # Use HfApi.file_exists instead of hf_fs.exists
+    if not hf_client.file_exists(
+        repo_id=_REPOSITORY,
+        filename='index.json',
+        repo_type='dataset'
+    ):
         retval = []
-        for pack in hf_fs.glob(f'datasets/{_REPOSITORY}/packs/*.zip'):
-            filename = os.path.basename(pack)
-            _info = hf_fs.info(f'datasets/{_REPOSITORY}/packs/{filename}')
-            size = _info['size']
+        # Use hf_repo_glob instead of hf_fs.glob
+        pack_files = hf_repo_glob(
+            repo_id=_REPOSITORY,
+            pattern='packs/*.zip',
+            repo_type='dataset',
+            hf_token=hf_token
+        )
+        for pack_item in pack_files:
+            filename = os.path.basename(pack_item.path)
+            size = pack_item.size
             retval.append({'filename': filename, 'size': size})
         return retval
     else:
-        return json.loads(hf_fs.read_text(f'datasets/{_REPOSITORY}/index.json'))
+        # Download and read the index.json file
+        with TemporaryDirectory() as td:
+            index_file = os.path.join(td, 'index.json')
+            download_file_to_file(
+                local_file=index_file,
+                repo_id=_REPOSITORY,
+                file_in_repo='index.json',
+                repo_type='dataset',
+                hf_token=hf_token
+            )
+            with open(index_file, 'r') as f:
+                return json.load(f)
 
 
 def _timestamp():
@@ -97,8 +125,24 @@ def _timestamp():
 
 def repack_all():
     _ensure_repository()
-    if hf_fs.exists(f'datasets/{_REPOSITORY}/archived.json'):
-        archived_resource_ids = json.loads(hf_fs.read_text(f'datasets/{_REPOSITORY}/archived.json'))
+    # Use HfApi.file_exists instead of hf_fs.exists
+    if hf_client.file_exists(
+        repo_id=_REPOSITORY,
+        filename='archived.json',
+        repo_type='dataset'
+    ):
+        # Download and read the archived.json file
+        with TemporaryDirectory() as td:
+            archived_file = os.path.join(td, 'archived.json')
+            download_file_to_file(
+                local_file=archived_file,
+                repo_id=_REPOSITORY,
+                file_in_repo='archived.json',
+                repo_type='dataset',
+                hf_token=hf_token
+            )
+            with open(archived_file, 'r') as f:
+                archived_resource_ids = json.load(f)
     else:
         archived_resource_ids = []
 
