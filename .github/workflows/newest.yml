@@ -60,7 +60,7 @@ jobs:
         shell: bash
         run: |
           python -V
-          pip --version
+          pip --version 
           pip list
           tree .
           cloc pyskeb
