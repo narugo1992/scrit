@@ -14,8 +14,8 @@ from hbutils.string import plural_word
 from hbutils.system import TemporaryDirectory
 from hfutils.archive import archive_pack
 from hfutils.index import tar_create_index_for_directory
-from hfutils.operate import get_hf_client, get_hf_fs, download_archive_as_directory, upload_directory_as_directory
-from hfutils.utils import parse_hf_fs_path, number_to_tag
+from hfutils.operate import get_hf_client, download_archive_as_directory, upload_directory_as_directory, hf_repo_glob
+from hfutils.utils import number_to_tag
 from tqdm import tqdm
 
 mimetypes.add_type('image/webp', '.webp')
@@ -25,32 +25,65 @@ Image.MAX_IMAGE_PIXELS = None
 def sync(src_repo: str, dst_repo: str, max_time_limit: float = 5.5 * 60 * 60):
     start_time = time.time()
     hf_client = get_hf_client()
-    hf_fs = get_hf_fs()
 
     if not hf_client.repo_exists(repo_id=dst_repo, repo_type='dataset'):
         hf_client.create_repo(repo_id=dst_repo, repo_type='dataset', private=False)
         hf_client.update_repo_visibility(repo_id=dst_repo, repo_type='dataset', private=False)
-        attr_lines = hf_fs.read_text(f'datasets/{dst_repo}/.gitattributes').splitlines(keepends=False)
-        attr_lines.append('*.json filter=lfs diff=lfs merge=lfs -text')
-        attr_lines.append('*.csv filter=lfs diff=lfs merge=lfs -text')
-        hf_fs.write_text(
-            f'datasets/{dst_repo}/.gitattributes',
-            os.linesep.join(attr_lines),
-        )
+
+        # Download .gitattributes, modify it, and upload back
+        with TemporaryDirectory() as td:
+            attr_file = os.path.join(td, '.gitattributes')
+
+            if hf_client.file_exists(repo_id=dst_repo, repo_type='dataset', filename='.gitattributes'):
+                downloaded_attr = hf_client.hf_hub_download(
+                    repo_id=dst_repo,
+                    repo_type='dataset',
+                    filename='.gitattributes',
+                    local_dir=td,
+                    local_dir_use_symlinks=False
+                )
+                with open(downloaded_attr, 'r') as f:
+                    attr_lines = f.read().splitlines(keepends=False)
+            else:
+                attr_lines = []
+
+            attr_lines.append('*.json filter=lfs diff=lfs merge=lfs -text')
+            attr_lines.append('*.csv filter=lfs diff=lfs merge=lfs -text')
+
+            with open(attr_file, 'w') as f:
+                f.write(os.linesep.join(attr_lines))
+
+            hf_client.upload_file(
+                path_or_fileobj=attr_file,
+                path_in_repo='.gitattributes',
+                repo_id=dst_repo,
+                repo_type='dataset',
+                commit_message='Update .gitattributes'
+            )
 
     src_zip_files = [
-        parse_hf_fs_path(file).filename
-        for file in hf_fs.glob(f'datasets/{src_repo}/*.zip')
+        os.path.basename(file)
+        for file in hf_repo_glob(
+            repo_id=src_repo,
+            repo_type='dataset',
+            pattern='*.zip',
+            return_path=True
+        )
     ]
     src_ids = [os.path.splitext(file)[0] for file in src_zip_files]
 
     dst_tar_files = [
-        os.path.basename(parse_hf_fs_path(file).filename)
-        for file in hf_fs.glob(f'datasets/{dst_repo}/packs/*.tar')
+        os.path.basename(file)
+        for file in hf_repo_glob(
+            repo_id=dst_repo,
+            repo_type='dataset',
+            pattern='packs/*.tar',
+            return_path=True
+        )
     ]
     dst_ids = set([os.path.splitext(file)[0] for file in dst_tar_files])
 
-    if hf_fs.exists(f'datasets/{dst_repo}/table.parquet'):
+    if hf_client.file_exists(repo_id=dst_repo, repo_type='dataset', filename='table.parquet'):
         df = pd.read_parquet(hf_client.hf_hub_download(
             repo_id=dst_repo,
             repo_type='dataset',
