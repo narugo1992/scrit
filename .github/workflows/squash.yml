@@ -4,8 +4,8 @@ name: Squash
 on:
   #  push:
   workflow_dispatch:
-  schedule:
-    - cron: '30 0 * * 6'
+#  schedule:
+#    - cron: '30 0 * * 6'
 
 jobs:
   unittest:
@@ -69,6 +69,7 @@ jobs:
         env:
           CI: 'true'
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_ENDPOINT: ${{ secrets.HF_ENDPOINT }}
           REMOTE_REPOSITORY: ${{ secrets.REMOTE_REPOSITORY }}
         shell: bash
         run: |
