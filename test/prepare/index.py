@@ -3,6 +3,7 @@ import json
 import mimetypes
 import os
 import re
+import shutil
 import time
 
 import magic
@@ -20,6 +21,35 @@ from tqdm import tqdm
 
 mimetypes.add_type('image/webp', '.webp')
 Image.MAX_IMAGE_PIXELS = None
+
+
+def _download_pack_with_retries(src_repo: str, pack_id: str, local_directory: str,
+                                max_retries: int = 3, retry_wait_time: float = 5.0) -> bool:
+    for attempt in range(max_retries):
+        if os.path.exists(local_directory):
+            shutil.rmtree(local_directory)
+        os.makedirs(local_directory, exist_ok=True)
+
+        try:
+            download_archive_as_directory(
+                repo_id=src_repo,
+                repo_type='dataset',
+                file_in_repo=f'{pack_id}.zip',
+                local_directory=local_directory,
+            )
+        except Exception as err:
+            if attempt + 1 < max_retries:
+                logging.warning(
+                    f'Download {pack_id!r} failed on attempt {attempt + 1}/{max_retries} - {err!r}, retry later.'
+                )
+                time.sleep(retry_wait_time)
+            else:
+                logging.exception(f'Download {pack_id!r} failed after {max_retries} attempts, skipped.')
+                return False
+        else:
+            return True
+
+    return False
 
 
 def sync(src_repo: str, dst_repo: str, max_time_limit: float = 5.5 * 60 * 60):
@@ -108,12 +138,8 @@ def sync(src_repo: str, dst_repo: str, max_time_limit: float = 5.5 * 60 * 60):
 
             with TemporaryDirectory() as tmpdir:
                 logging.info(f'Downloading {pack_id!r} from src repo ...')
-                download_archive_as_directory(
-                    repo_id=src_repo,
-                    repo_type='dataset',
-                    file_in_repo=f'{pack_id}.zip',
-                    local_directory=tmpdir,
-                )
+                if not _download_pack_with_retries(src_repo=src_repo, pack_id=pack_id, local_directory=tmpdir):
+                    continue
 
                 logging.info('Packing archive ...')
                 archive_pack('tar', tmpdir, tar_file)
