@@ -2,6 +2,7 @@ import json
 import os.path
 import re
 import shutil
+import time
 import zipfile
 
 import pandas as pd
@@ -64,53 +65,95 @@ def bact_crawl(repository: str, maxcnt: int = 100):
         img_dir = os.path.join(td, 'images')
         os.makedirs(img_dir, exist_ok=True)
 
-        resp = session.get(
-            'https://api.bilibili.com/x/garb/card/subject/list',
-            params={
-                'buvid': b3,
-                'subject_id': '42'
-            }
-        )
-        resp.raise_for_status()
-
-        current_count = 0
-        lst = resp.json()['data']['subject_card_list']
-        for item in lst:
-            act_id = item['act_id']
-            act_name = item['act_name']
-            lottery_id = item['lottery_id']
-            suit_id = f'act_{act_id}_lottery_{lottery_id}'
-            logging.info(f'Suit item {suit_id!r} (name: {act_name!r}) detected.')
-            if suit_id in exist_sids:
-                logging.info(f'Suit item {suit_id!r} already crawled, skipped.')
-                continue
-            if not item.get('act_link'):
-                logging.info(f'No act link found for {suit_id!r}, skipped.')
-                continue
-
+        lst = []
+        for attempt in range(5):
             resp = session.get(
-                'https://api.bilibili.com/x/vas/dlc_act/lottery_home_detail',
+                'https://api.bilibili.com/x/garb/card/subject/list',
                 params={
-                    'act_id': str(act_id),
-                    'lottery_id': str(lottery_id),
+                    'buvid': b3,
+                    'subject_id': '42'
                 }
             )
             resp.raise_for_status()
-            lottery_name = resp.json()['data']['name']
-
-            for li_id, li_item in enumerate(resp.json()['data']['item_list']):
-                card_img_url = li_item['card_info']['card_img']
-                card_img_name = f'act_{act_id}__{_name_safe(act_name)}__lottery_{lottery_id}__{_name_safe(lottery_name)}__{li_id}'
-                _, ext = os.path.splitext(urlsplit(card_img_url).filename)
-                dst_file = os.path.join(img_dir, f'{card_img_name}{ext}')
-                logging.info(f'Downloading {card_img_url!r} to {dst_file!r} ...')
-                download_file(card_img_url, filename=dst_file, session=session)
-
-            exist_sids.add(suit_id)
-            pg.update()
-            current_count += 1
-            if current_count >= maxcnt:
+            data = resp.json().get('data') or {}
+            lst = data.get('subject_card_list') or []
+            if lst:
                 break
+            backoff = min(60, 5 * (attempt + 1))
+            logging.warning(
+                f'subject_card_list is empty/None on attempt {attempt + 1}/5; '
+                f'retrying after {backoff}s ...'
+            )
+            time.sleep(backoff)
+
+        if not lst:
+            logging.error(
+                'subject_card_list still empty after retries; bilibili likely '
+                'rate-limiting this egress. Quitting cleanly without new entries.'
+            )
+            return
+
+        current_count = 0
+        for item in lst:
+            try:
+                act_id = item['act_id']
+                act_name = item['act_name']
+                lottery_id = item['lottery_id']
+                suit_id = f'act_{act_id}_lottery_{lottery_id}'
+                logging.info(f'Suit item {suit_id!r} (name: {act_name!r}) detected.')
+                if suit_id in exist_sids:
+                    logging.info(f'Suit item {suit_id!r} already crawled, skipped.')
+                    continue
+                if not item.get('act_link'):
+                    logging.info(f'No act link found for {suit_id!r}, skipped.')
+                    continue
+
+                resp = session.get(
+                    'https://api.bilibili.com/x/vas/dlc_act/lottery_home_detail',
+                    params={
+                        'act_id': str(act_id),
+                        'lottery_id': str(lottery_id),
+                    }
+                )
+                resp.raise_for_status()
+                detail_data = resp.json().get('data') or {}
+                lottery_name = detail_data.get('name') or ''
+                item_list = detail_data.get('item_list') or []
+
+                item_ok = True
+                for li_id, li_item in enumerate(item_list):
+                    card_info = (li_item or {}).get('card_info') or {}
+                    card_img_url = card_info.get('card_img')
+                    if not card_img_url:
+                        continue
+                    card_img_name = f'act_{act_id}__{_name_safe(act_name)}__lottery_{lottery_id}__{_name_safe(lottery_name)}__{li_id}'
+                    _, ext = os.path.splitext(urlsplit(card_img_url).filename)
+                    dst_file = os.path.join(img_dir, f'{card_img_name}{ext}')
+                    logging.info(f'Downloading {card_img_url!r} to {dst_file!r} ...')
+                    try:
+                        download_file(card_img_url, filename=dst_file, session=session)
+                    except Exception as download_err:
+                        logging.warning(
+                            f'Download failed for {card_img_url!r}: {download_err!r}, skipping image.'
+                        )
+                        item_ok = False
+
+                if item_ok:
+                    exist_sids.add(suit_id)
+                else:
+                    logging.info(
+                        f'Suit item {suit_id!r} had partial download failures, '
+                        f'leaving unmarked so it retries next run.'
+                    )
+                pg.update()
+                current_count += 1
+                if current_count >= maxcnt:
+                    break
+            except Exception as item_err:
+                logging.exception(
+                    f'Failed to process act list item {item.get("act_id")!r}/{item.get("lottery_id")!r}: {item_err!r}'
+                )
+                continue
 
         if not os.listdir(img_dir):
             logging.warning('No images found, quit.')

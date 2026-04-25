@@ -89,50 +89,69 @@ def bsuit_crawl(repository: str, maxcnt: int = 100):
                 break
 
             for item in lst:
-                item_id = item['item_id']
-                suit_id = f'suit_{item_id}'
-                group_name = item['group_name']
-                short_name = item['name']
-                name = f'{group_name}_{short_name}' if group_name != short_name else short_name
-                logging.info(f'Suit item {suit_id!r} (name: {name!r}) detected.')
-                if suit_id in exist_sids:
-                    logging.info(f'Suit item {suit_id!r} already crawled, skipped.')
+                try:
+                    item_id = item['item_id']
+                    suit_id = f'suit_{item_id}'
+                    group_name = item['group_name']
+                    short_name = item['name']
+                    name = f'{group_name}_{short_name}' if group_name != short_name else short_name
+                    logging.info(f'Suit item {suit_id!r} (name: {name!r}) detected.')
+                    if suit_id in exist_sids:
+                        logging.info(f'Suit item {suit_id!r} already crawled, skipped.')
+                        continue
+
+                    jump_link = item['jump_link']
+                    if not jump_link:
+                        continue
+
+                    resp = session.get(
+                        'https://api.bilibili.com/x/garb/v2/mall/suit/detail',
+                        params={
+                            'buvid': b3,
+                            'from': '',
+                            'from_id': '',
+                            'item_id': item_id,
+                            'part': 'suit',
+                        }
+                    )
+                    resp.raise_for_status()
+
+                    sitems = (resp.json().get('data') or {}).get('suit_items') or {}
+
+                    item_ok = True
+                    for sk_i, sk_item in enumerate(sitems.get('skin') or []):
+                        sk_pp = (sk_item or {}).get('properties') or {}
+                        vname = f'suit_{item_id}__{_name_safe(name)}__{sk_i}'
+                        vurl = sk_pp.get('head_myself_mp4_bg')
+
+                        if vurl:
+                            _, ext = os.path.splitext(urlsplit(vurl).filename)
+                            dst_file = os.path.join(img_dir, f'{vname}{ext}')
+                            logging.info(f'Downloading {vurl!r} to {dst_file!r} ...')
+                            try:
+                                download_file(vurl, filename=dst_file, session=session)
+                            except Exception as download_err:
+                                logging.warning(
+                                    f'Download failed for {vurl!r}: {download_err!r}, skipping video.'
+                                )
+                                item_ok = False
+
+                    current_count += 1
+                    pg.update()
+                    if item_ok:
+                        exist_sids.add(suit_id)
+                    else:
+                        logging.info(
+                            f'Suit item {suit_id!r} had partial download failures, '
+                            f'leaving unmarked so it retries next run.'
+                        )
+                    if current_count >= maxcnt:
+                        break
+                except Exception as item_err:
+                    logging.exception(
+                        f'Failed to process suit list item {item.get("item_id")!r}: {item_err!r}'
+                    )
                     continue
-
-                jump_link = item['jump_link']
-                if not jump_link:
-                    continue
-
-                resp = session.get(
-                    'https://api.bilibili.com/x/garb/v2/mall/suit/detail',
-                    params={
-                        'buvid': b3,
-                        'from': '',
-                        'from_id': '',
-                        'item_id': item_id,
-                        'part': 'suit',
-                    }
-                )
-                resp.raise_for_status()
-
-                sitems = resp.json()['data']['suit_items']
-
-                for sk_i, sk_item in enumerate(sitems.get('skin') or []):
-                    sk_pp = sk_item['properties']
-                    vname = f'suit_{item_id}__{_name_safe(name)}__{sk_i}'
-                    vurl = sk_pp.get('head_myself_mp4_bg')
-
-                    if vurl:
-                        _, ext = os.path.splitext(urlsplit(vurl).filename)
-                        dst_file = os.path.join(img_dir, f'{vname}{ext}')
-                        logging.info(f'Downloading {vurl!r} to {dst_file!r} ...')
-                        download_file(vurl, filename=dst_file, session=session)
-
-                current_count += 1
-                pg.update()
-                exist_sids.add(suit_id)
-                if current_count >= maxcnt:
-                    break
 
             if current_count >= maxcnt:
                 break
