@@ -4,9 +4,9 @@ name: NBsuit
 on:
   #  push:
   workflow_dispatch:
-#  schedule:
+  schedule:
 #    - cron: '15 */1 * * *'
-#    - cron: '0 12 * * 6'
+    - cron: '0 12 * * 6'
 
 jobs:
   unittest:
