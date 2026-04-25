@@ -2,6 +2,29 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+`AGENTS.md` in the repo root is a symlink to this file (`AGENTS.md -> CLAUDE.md`). All AI coding agents (Claude Code, Codex, Cursor, etc.) read the same instructions — edit `CLAUDE.md` only; do not replace the symlink with a separate file.
+
+## Working with `gh` (GitHub CLI)
+
+Before running ANY `gh` command (creating PRs/issues, commenting, merging, releasing, etc.), you MUST:
+
+1. Run `git config user.name` and `git config user.email` to identify the current repo's git author.
+2. Run `gh auth status` to list every GitHub account `gh` knows about (active and inactive). Identify the account whose login (or associated email) matches the git user from step 1 — call this `<MATCHED_USER>`.
+3. Run every `gh` invocation with that account's token injected via env var, NOT by switching the active account. The verified pattern is:
+
+   ```bash
+   GH_TOKEN=$(gh auth token --user <MATCHED_USER>) gh <subcommand> ...
+   ```
+
+   `GH_TOKEN` takes precedence over `gh`'s stored active account for that single process, so the command runs as `<MATCHED_USER>` regardless of which account is "active". Verify with `GH_TOKEN=$(gh auth token --user <MATCHED_USER>) gh api user --jq .login` — it must print `<MATCHED_USER>`.
+4. If no matching account can be found in `gh auth status` (no auth, no account matches the git user, ambiguous mapping), **refuse to run the `gh` command** and report the mismatch to the user. Do NOT guess, do NOT proceed with a non-matching account, and do NOT silently use whatever account `gh` defaults to.
+
+### Forbidden: `gh auth switch`
+
+Do **NOT** use `gh auth switch` to change accounts before running `gh` commands. `gh auth switch` mutates global state in `~/.config/gh/hosts.yml` (the "active account" pointer); when multiple processes/agents run concurrently on this machine, one process's switch silently changes the active account under another process's feet, causing PRs/comments to be created under the wrong identity. Always use the per-process `GH_TOKEN=$(gh auth token --user ...)` pattern instead — it scopes the account choice to one command and cannot race with other processes.
+
+Rationale: this repo has been touched by multiple git identities, and this machine routinely runs concurrent agents/automation. Running `gh` under the wrong account creates PRs/comments attributed to the wrong person and is hard to undo.
+
 ## Project Overview
 
 This is a web scraping and data archival repository that crawls artwork URLs from Skeb.jp posts and downloads content from various file hosting services (Google Drive, Imgur, Dropbox) to HuggingFace datasets. The `pyskeb` package is a minimal client wrapper; the core functionality is in `test/prepare/` scripts.
