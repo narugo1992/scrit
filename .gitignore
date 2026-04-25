@@ -1039,6 +1039,9 @@ ENV/
 env.bak/
 venv.bak/
 
+# Claude Code local working files
+.claude/
+
 # Spyder project settings
 .spyderproject
 .spyproject

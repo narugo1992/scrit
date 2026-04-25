@@ -11,6 +11,7 @@ from hbutils.string import plural_word
 from hbutils.system import TemporaryDirectory, urlsplit
 from hfutils.operate import download_file_to_file, upload_directory_as_directory
 from huggingface_hub import hf_hub_url
+from requests.exceptions import RequestException
 from tqdm import tqdm
 
 from pyskeb.utils import get_random_mobile_ua, download_file, get_requests_session
@@ -89,73 +90,67 @@ def bsuit_crawl(repository: str, maxcnt: int = 100):
                 break
 
             for item in lst:
-                try:
-                    item_id = item['item_id']
-                    suit_id = f'suit_{item_id}'
-                    group_name = item['group_name']
-                    short_name = item['name']
-                    name = f'{group_name}_{short_name}' if group_name != short_name else short_name
-                    logging.info(f'Suit item {suit_id!r} (name: {name!r}) detected.')
-                    if suit_id in exist_sids:
-                        logging.info(f'Suit item {suit_id!r} already crawled, skipped.')
-                        continue
-
-                    jump_link = item['jump_link']
-                    if not jump_link:
-                        continue
-
-                    resp = session.get(
-                        'https://api.bilibili.com/x/garb/v2/mall/suit/detail',
-                        params={
-                            'buvid': b3,
-                            'from': '',
-                            'from_id': '',
-                            'item_id': item_id,
-                            'part': 'suit',
-                        }
-                    )
-                    resp.raise_for_status()
-
-                    suit_items = (resp.json().get('data') or {}).get('suit_items') or {}
-                    item_ok = True
-                    for sb_i, sb_item in enumerate(suit_items.get('space_bg') or []):
-                        sb_pp = (sb_item or {}).get('properties') or {}
-                        vi = 1
-                        while True:
-                            if f'image{vi}_portrait' not in sb_pp:
-                                break
-
-                            image_url = sb_pp[f'image{vi}_portrait']
-                            image_name = f'suit_{item_id}__{_name_safe(name)}__{sb_i}-{vi}'
-                            _, ext = os.path.splitext(urlsplit(image_url).filename)
-                            dst_file = os.path.join(img_dir, f'{image_name}{ext}')
-                            logging.info(f'Downloading {image_url!r} to {dst_file!r} ...')
-                            try:
-                                download_file(image_url, filename=dst_file, session=session)
-                            except Exception as download_err:
-                                logging.warning(
-                                    f'Download failed for {image_url!r}: {download_err!r}, skipping image.'
-                                )
-                                item_ok = False
-
-                            vi += 1
-
-                    current_count += 1
-                    pg.update()
-                    if item_ok:
-                        exist_sids.add(suit_id)
-                    else:
-                        logging.info(
-                            f'Suit item {suit_id!r} had partial download failures, '
-                            f'leaving unmarked so it retries next run.'
-                        )
-                    if current_count >= maxcnt:
-                        break
-                except Exception as item_err:
-                    logging.exception(
-                        f'Failed to process suit list item {item.get("item_id")!r}: {item_err!r}'
-                    )
+                item_id = item['item_id']
+                suit_id = f'suit_{item_id}'
+                group_name = item['group_name']
+                short_name = item['name']
+                name = f'{group_name}_{short_name}' if group_name != short_name else short_name
+                logging.info(f'Suit item {suit_id!r} (name: {name!r}) detected.')
+                if suit_id in exist_sids:
+                    logging.info(f'Suit item {suit_id!r} already crawled, skipped.')
                     continue
+
+                jump_link = item['jump_link']
+                if not jump_link:
+                    continue
+
+                resp = session.get(
+                    'https://api.bilibili.com/x/garb/v2/mall/suit/detail',
+                    params={
+                        'buvid': b3,
+                        'from': '',
+                        'from_id': '',
+                        'item_id': item_id,
+                        'part': 'suit',
+                    }
+                )
+                resp.raise_for_status()
+
+                suit_items = (resp.json().get('data') or {}).get('suit_items') or {}
+                item_ok = True
+                for sb_i, sb_item in enumerate(suit_items.get('space_bg') or []):
+                    sb_pp = (sb_item or {}).get('properties') or {}
+                    vi = 1
+                    while True:
+                        if f'image{vi}_portrait' not in sb_pp:
+                            break
+
+                        image_url = sb_pp[f'image{vi}_portrait']
+                        image_name = f'suit_{item_id}__{_name_safe(name)}__{sb_i}-{vi}'
+                        _, ext = os.path.splitext(urlsplit(image_url).filename)
+                        dst_file = os.path.join(img_dir, f'{image_name}{ext}')
+                        logging.info(f'Downloading {image_url!r} to {dst_file!r} ...')
+                        try:
+                            download_file(image_url, filename=dst_file, session=session)
+                        except RequestException as download_err:
+                            logging.warning(
+                                f'Download failed for {image_url!r}: {download_err!r}, skipping image.'
+                            )
+                            item_ok = False
+
+                        vi += 1
+
+                current_count += 1
+                pg.update()
+                if item_ok:
+                    exist_sids.add(suit_id)
+                else:
+                    logging.info(
+                        f'Suit item {suit_id!r} had partial download failures, '
+                        f'leaving unmarked so it retries next run.'
+                    )
+                if current_count >= maxcnt:
+                    break
 
             if current_count >= maxcnt:
                 break

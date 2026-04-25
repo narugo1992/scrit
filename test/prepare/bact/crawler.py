@@ -12,6 +12,7 @@ from hbutils.string import plural_word
 from hbutils.system import TemporaryDirectory, urlsplit
 from hfutils.operate import download_file_to_file, upload_directory_as_directory
 from huggingface_hub import hf_hub_url
+from requests.exceptions import RequestException
 from tqdm import tqdm
 
 from pyskeb.utils import get_random_mobile_ua, download_file, get_requests_session
@@ -95,65 +96,59 @@ def bact_crawl(repository: str, maxcnt: int = 100):
 
         current_count = 0
         for item in lst:
-            try:
-                act_id = item['act_id']
-                act_name = item['act_name']
-                lottery_id = item['lottery_id']
-                suit_id = f'act_{act_id}_lottery_{lottery_id}'
-                logging.info(f'Suit item {suit_id!r} (name: {act_name!r}) detected.')
-                if suit_id in exist_sids:
-                    logging.info(f'Suit item {suit_id!r} already crawled, skipped.')
-                    continue
-                if not item.get('act_link'):
-                    logging.info(f'No act link found for {suit_id!r}, skipped.')
-                    continue
-
-                resp = session.get(
-                    'https://api.bilibili.com/x/vas/dlc_act/lottery_home_detail',
-                    params={
-                        'act_id': str(act_id),
-                        'lottery_id': str(lottery_id),
-                    }
-                )
-                resp.raise_for_status()
-                detail_data = resp.json().get('data') or {}
-                lottery_name = detail_data.get('name') or ''
-                item_list = detail_data.get('item_list') or []
-
-                item_ok = True
-                for li_id, li_item in enumerate(item_list):
-                    card_info = (li_item or {}).get('card_info') or {}
-                    card_img_url = card_info.get('card_img')
-                    if not card_img_url:
-                        continue
-                    card_img_name = f'act_{act_id}__{_name_safe(act_name)}__lottery_{lottery_id}__{_name_safe(lottery_name)}__{li_id}'
-                    _, ext = os.path.splitext(urlsplit(card_img_url).filename)
-                    dst_file = os.path.join(img_dir, f'{card_img_name}{ext}')
-                    logging.info(f'Downloading {card_img_url!r} to {dst_file!r} ...')
-                    try:
-                        download_file(card_img_url, filename=dst_file, session=session)
-                    except Exception as download_err:
-                        logging.warning(
-                            f'Download failed for {card_img_url!r}: {download_err!r}, skipping image.'
-                        )
-                        item_ok = False
-
-                if item_ok:
-                    exist_sids.add(suit_id)
-                else:
-                    logging.info(
-                        f'Suit item {suit_id!r} had partial download failures, '
-                        f'leaving unmarked so it retries next run.'
-                    )
-                pg.update()
-                current_count += 1
-                if current_count >= maxcnt:
-                    break
-            except Exception as item_err:
-                logging.exception(
-                    f'Failed to process act list item {item.get("act_id")!r}/{item.get("lottery_id")!r}: {item_err!r}'
-                )
+            act_id = item['act_id']
+            act_name = item['act_name']
+            lottery_id = item['lottery_id']
+            suit_id = f'act_{act_id}_lottery_{lottery_id}'
+            logging.info(f'Suit item {suit_id!r} (name: {act_name!r}) detected.')
+            if suit_id in exist_sids:
+                logging.info(f'Suit item {suit_id!r} already crawled, skipped.')
                 continue
+            if not item.get('act_link'):
+                logging.info(f'No act link found for {suit_id!r}, skipped.')
+                continue
+
+            resp = session.get(
+                'https://api.bilibili.com/x/vas/dlc_act/lottery_home_detail',
+                params={
+                    'act_id': str(act_id),
+                    'lottery_id': str(lottery_id),
+                }
+            )
+            resp.raise_for_status()
+            detail_data = resp.json().get('data') or {}
+            lottery_name = detail_data.get('name') or ''
+            item_list = detail_data.get('item_list') or []
+
+            item_ok = True
+            for li_id, li_item in enumerate(item_list):
+                card_info = (li_item or {}).get('card_info') or {}
+                card_img_url = card_info.get('card_img')
+                if not card_img_url:
+                    continue
+                card_img_name = f'act_{act_id}__{_name_safe(act_name)}__lottery_{lottery_id}__{_name_safe(lottery_name)}__{li_id}'
+                _, ext = os.path.splitext(urlsplit(card_img_url).filename)
+                dst_file = os.path.join(img_dir, f'{card_img_name}{ext}')
+                logging.info(f'Downloading {card_img_url!r} to {dst_file!r} ...')
+                try:
+                    download_file(card_img_url, filename=dst_file, session=session)
+                except RequestException as download_err:
+                    logging.warning(
+                        f'Download failed for {card_img_url!r}: {download_err!r}, skipping image.'
+                    )
+                    item_ok = False
+
+            if item_ok:
+                exist_sids.add(suit_id)
+            else:
+                logging.info(
+                    f'Suit item {suit_id!r} had partial download failures, '
+                    f'leaving unmarked so it retries next run.'
+                )
+            pg.update()
+            current_count += 1
+            if current_count >= maxcnt:
+                break
 
         if not os.listdir(img_dir):
             logging.warning('No images found, quit.')
