@@ -2,12 +2,10 @@ import logging
 import mimetypes
 import os
 import re
-import warnings
 from typing import List, Optional, Tuple
 from urllib.parse import urlsplit
 
-from gdown.download_folder import _download_and_parse_google_drive_link
-from gdown.download import _get_session
+from gdown.download_folder import _parse_google_drive_file
 
 from .common import host_of, fetch_file
 from ..errors import ResourceGone, ResourceBlocked, ResourceTransient, NoContent, UnexpectedResponse
@@ -15,7 +13,7 @@ from ..http import Fetcher, safe_name
 
 NAME = 'google'
 
-_ID = r'[\w-]{10,}'
+_ID = r'[A-Za-z0-9_-]{10,}'
 _FOLDER_MIME = 'application/vnd.google-apps.folder'
 _IMAGE_VIA_LH3 = {'image/png', 'image/jpeg', 'image/gif', 'image/webp'}
 _DOC_EXPORT = {
@@ -77,31 +75,53 @@ def _fix_name(name: str, mime: str) -> str:
     return name
 
 
+_MAX_FOLDER_PAGES = 200
+_PAGE_LIMIT = 50  # a Drive folder page lists at most this many direct children
+
+
+def _parse_page(fx: Fetcher, folder_id: str) -> Tuple[str, List[Tuple[str, str, str]]]:
+    """Fetch one folder page; returns the folder name and its ``(id, name, mime)`` children."""
+    url = f'https://drive.google.com/drive/folders/{folder_id}?hl=en'
+    resp = fx.get(url)
+    if resp.status_code == 429 or 'google.com/sorry' in resp.url:
+        raise ResourceBlocked(f'Drive folder page {folder_id} is throttled', cooldown=10 * 60.0)
+    if resp.status_code in (404, 410) or 'accounts.google.com' in resp.url:
+        raise ResourceGone(f'Drive folder {folder_id} is gone or private (HTTP {resp.status_code})')
+    if resp.status_code != 200:
+        raise ResourceTransient(f'Drive folder page {folder_id} -> HTTP {resp.status_code}')
+    try:
+        node, children = _parse_google_drive_file(url, resp.text)
+    except RuntimeError as err:
+        # gdown raises RuntimeError for a normal page without folder data: not shared, or no longer there
+        raise ResourceGone(f'Drive folder {folder_id} cannot be read: {err}') from err
+    return node.name, list(children)
+
+
 def _list_folder(fx: Fetcher, folder_id: str) -> List[Tuple[str, List[str], str]]:
-    session = _get_session(use_cookies=False, proxy=None, user_agent=fx.session.headers['User-Agent'])
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore')
-        _, root = _download_and_parse_google_drive_link(
-            session, f'https://drive.google.com/drive/folders/{folder_id}', quiet=True, remaining_ok=True)
-    if root is None:
-        raise ResourceGone(f'Drive folder {folder_id} is unavailable')
-
-    truncated = []
     entries: List[Tuple[str, List[str], str]] = []
+    truncated = []
+    pages = [0]
+    root_name = ['']
 
-    def walk(node, parts):
-        if _FOLDER_MIME in node.type or 'folder' in node.type:
-            if len(node.children) >= 50:
-                truncated.append(node.id)
-            for child in node.children:
-                walk(child, [*parts, safe_name(node.name)])
-        else:
-            entries.append((node.id, [*parts, _fix_name(node.name, node.type)], node.type))
+    def walk(fid: str, parts: List[str], depth: int):
+        pages[0] += 1
+        name, children = _parse_page(fx, fid)
+        if fid == folder_id:
+            root_name[0] = name
+        base = [*parts, safe_name(name)]
+        if len(children) >= _PAGE_LIMIT:
+            truncated.append(fid)
+        for child_id, child_name, child_type in children:
+            if child_type == _FOLDER_MIME:
+                if depth < _MAX_DRIVE_API_DEPTH and pages[0] < _MAX_FOLDER_PAGES:
+                    walk(child_id, base, depth + 1)
+            else:
+                entries.append((child_id, [*base, _fix_name(child_name, child_type)], child_type))
 
-    walk(root, [])
+    walk(folder_id, [], 0)
     if truncated:
-        logging.info(f'Drive folder {folder_id} has a folder with >= 50 children, listing via the Drive API')
-        api_entries = _list_folder_api(fx, folder_id, root.name)
+        logging.info(f'Drive folder {folder_id} has a folder with >= {_PAGE_LIMIT} children, listing via the Drive API')
+        api_entries = _list_folder_api(fx, folder_id, root_name[0])
         if len(api_entries) >= len(entries):
             return api_entries
         logging.warning(f'Drive API listing for {folder_id} is shorter ({len(api_entries)}) than the page '
