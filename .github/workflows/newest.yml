@@ -6,9 +6,11 @@ run-name: Newest${{ github.event.inputs.once == 'true' && ' (once)' || '' }}${{ 
 # - A run polls skeb.jp for new posts every 10 minutes for up to 330 minutes, then dispatches the next run itself
 #   (the chain step below), so the crawler is effectively always running. GITHUB_TOKEN dispatches are not subject
 #   to the schedule delays GitHub has had since 2026-08-27, which is why no cron entry is used.
-# - If a run ends without dispatching its successor (the runner was lost), newest_resume.yml notices the run
-#   finishing and starts a new one. Cancelling a run is the way to stop the crawler: neither the chain step nor
-#   the resume workflow act on a cancelled run.
+# - Every way a run can end is covered. A clean end (budget reached) dispatches the successor. A crash or an error
+#   dispatches it too, unless the run died within 15 minutes. A run that GitHub kills (6 hour job limit, lost
+#   runner, outage) skips the steps below, and newest_resume.yml, which fires when any Newest run finishes, starts
+#   a new one. The crawler also ends itself 10 minutes after its 330 minute budget, long before the 6 hour limit.
+#   Cancelling a run is the way to stop the crawler: nothing restarts a run that was cancelled early.
 # - Only one crawler runs at a time: the concurrency group queues a dispatched run until the previous one has
 #   ended, and the crawler also holds a lease in the dataset (state/lease.json).
 # - Posts stay listed for about 3.5 days, so even a long outage is recovered from the cursor in the dataset.
@@ -94,9 +96,17 @@ jobs:
             echo "::warning::the crawl failed after ${elapsed}s, not chaining"
             exit 0
           fi
-          gh workflow run newest.yml -R "${{ github.repository }}" \
-            -f budget_minutes="${{ github.event.inputs.budget_minutes || '330' }}" \
-            -f bootstrap="${{ github.event.inputs.bootstrap || '400' }}"
+          for attempt in 1 2 3 4 5; do
+            if gh workflow run newest.yml -R "${{ github.repository }}" \
+                -f budget_minutes="${{ github.event.inputs.budget_minutes || '330' }}" \
+                -f bootstrap="${{ github.event.inputs.bootstrap || '400' }}"; then
+              exit 0
+            fi
+            echo "::warning::dispatching the next run failed (attempt $attempt)"
+            sleep $(( attempt * 20 ))
+          done
+          echo "::error::the next run could not be dispatched, newest_resume.yml will start it"
+          exit 1
       - name: Report the crawl result
         if: ${{ steps.crawl.outcome == 'failure' && steps.crawl.outputs.code != '4' }}
         shell: bash

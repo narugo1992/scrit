@@ -1,6 +1,8 @@
 import logging
 import os
 import re
+import signal
+import threading
 import time
 import traceback
 import uuid
@@ -63,6 +65,8 @@ class RunConfig:
     retry_batch: int = 20
     max_extra_posts: int = 100
     lease_every: float = 300.0
+    hard_extra: float = 600.0       # seconds after the budget at which the run is ended whatever it is doing
+    hard_deadline: bool = False
     once: bool = False
 
 
@@ -180,6 +184,7 @@ class Runner:
         gone = queued = dup = 0
         with TemporaryDirectory() as td:
             for job in jobs:
+                self._keep_lease()
                 status, zip_path = self._attempt(job, td)
                 self._count(job.site.NAME, 'uploaded' if status == 'ok' else status)
                 if status == 'ok':
@@ -371,7 +376,33 @@ class Runner:
         checked, self._checked = self._checked, 0
         waiting = plural(len(self.store.backlog), 'post')
         what = f'{plural(checked, "post")} checked, nothing to fetch' if checked else 'queue and cursor updated'
-        self.store.commit({}, f'[state] {what} | {waiting} waiting')
+        try:
+            self.store.commit({}, f'[state] {what} | {waiting} waiting')
+        except CommitFailed as err:
+            # the hub is having trouble; the state stays dirty and goes out with the next commit
+            logging.error(f'state not saved for now: {err}')
+
+    @staticmethod
+    def _on_hard_deadline(signum, frame):
+        print('::error title=hard deadline::the run is over its time limit and ends now so the next one can start',
+              flush=True)
+        raise SystemExit(5)
+
+    def _arm_hard_deadline(self):
+        """GitHub kills a job after 6 hours and skips whatever should run afterwards, so the crawler ends itself well
+        before: first by a signal (clean exit, lease released), and if that cannot get through, by force."""
+        seconds = int(self.config.budget_seconds + self.config.hard_extra)
+        signal.signal(signal.SIGALRM, self._on_hard_deadline)
+        signal.alarm(seconds)
+        self._force_exit = threading.Timer(seconds + 90, os._exit, args=(5,))
+        self._force_exit.daemon = True
+        self._force_exit.start()
+
+    def _disarm_hard_deadline(self):
+        signal.alarm(0)
+        timer = getattr(self, '_force_exit', None)
+        if timer is not None:
+            timer.cancel()
 
     def _keep_lease(self, force: bool = False):
         if not self.use_lease or (not force and self.clock() - self._last_lease < self.config.lease_every):
@@ -430,6 +461,8 @@ class Runner:
         if self.use_lease:
             self.store.acquire_lease(self.holder)
             self._last_lease = self.clock()
+        if self.config.hard_deadline:
+            self._arm_hard_deadline()
         try:
             while True:
                 self.store.refresh()
@@ -445,6 +478,8 @@ class Runner:
             self.stop_reason = 'lease lost'
             return
         finally:
+            if self.config.hard_deadline:
+                self._disarm_hard_deadline()
             if self.use_lease and self.stop_reason != 'lease lost':
                 self.store.release_lease(self.holder)
 

@@ -54,8 +54,9 @@ class Store:
         self._dirty_pending = False
         self._index_loaded_at = 0.0
         self.last_commit_at = time.time()
-        # tells whether the run that wrote a lease has ended, so a cancelled or lost run does not block its successor
-        self.holder_finished: Callable[[str], bool] = lambda run_id: False
+        # status of the GitHub run that wrote a lease (None = unknown), so a cancelled or lost run does not block its successor
+        self.holder_status: Callable[[str], Optional[str]] = lambda run_id: None
+        self._holding: Optional[str] = None
 
     # ------------------------------------------------------------ reading
     def _read_json(self, path: str, default):
@@ -232,40 +233,55 @@ class Store:
             [CommitOperationAdd(path_in_repo=LEASE_PATH, path_or_fileobj=json.dumps(body).encode('utf-8'))],
             f'[lease] held by run {body["run"] or "local"}' if holder else '[lease] released')
 
-    def _held_by_other(self, lease: Dict, holder: str) -> bool:
+    def _held_by_other(self, lease: Dict, holder: str):
+        """``None`` when the lease is free to take, otherwise the status of the holder's run ('' if unknown)."""
         if not lease.get('holder') or lease['holder'] == holder:
-            return False
+            return None
         if time.time() - lease.get('at', 0) > LEASE_TTL:
-            return False
-        if lease.get('run') and self.holder_finished(lease['run']):
+            return None
+        status = (self.holder_status(lease['run']) if lease.get('run') else None) or ''
+        if status == 'completed':
             logging.info(f'The run {lease["run"]} that held the lease has ended, taking it over.')
-            return False
-        return True
+            return None
+        return status
 
-    def acquire_lease(self, holder: str, wait_limit: float = LEASE_TTL + 300,
+    def acquire_lease(self, holder: str, wait_limit: float = LEASE_TTL + 300, alive_wait: float = 180.0,
                       sleep=time.sleep, settle: float = LEASE_SETTLE):
-        deadline = time.time() + wait_limit
+        """Take the lease. A holder whose GitHub run has ended is replaced at once; one whose run is still going gets
+        only ``alive_wait`` seconds (it is about to end, or a second crawler is running and must not wait for hours);
+        an unknown holder (a manual run) is waited for until its lease expires."""
+        started = time.time()
+        deadline = started + wait_limit
         while True:
             lease = self.read_lease()
-            if not self._held_by_other(lease, holder):
+            held = self._held_by_other(lease, holder)
+            if held is None:
                 self._write_lease(holder)
                 sleep(settle)
                 if self.read_lease().get('holder') == holder:
+                    self._holding = holder
                     return
                 logging.warning('Another crawler wrote the lease at the same moment and won it.')
             else:
-                logging.info(f'Lease held by {lease["holder"]!r} (refreshed {time.time() - lease["at"]:.0f}s ago), waiting ...')
+                if held in ('in_progress', 'queued', 'waiting', 'pending'):
+                    deadline = min(deadline, started + alive_wait)
+                logging.info(f'Lease held by {lease["holder"]!r} (run status {held or "unknown"}, refreshed '
+                             f'{time.time() - lease["at"]:.0f}s ago), waiting ...')
             if time.time() > deadline:
                 raise LeaseUnavailable(f'the lease is still held by {self.read_lease().get("holder")!r}')
             sleep(30.0)
 
     def keep_lease(self, holder: str) -> bool:
         """Refresh the lease; False means another live crawler has taken over."""
-        if self._held_by_other(self.read_lease(), holder):
+        if self._held_by_other(self.read_lease(), holder) is not None:
+            self._holding = None  # no longer ours, so release_lease must leave it alone
             return False
         self._write_lease(holder)
+        self._holding = holder
         return True
 
     def release_lease(self, holder: str):
-        if self.read_lease().get('holder') == holder:
+        """One write and nothing else: a cancelled job is killed a few seconds after the signal."""
+        if self._holding == holder:
             self._write_lease(None)
+            self._holding = None

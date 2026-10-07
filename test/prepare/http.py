@@ -41,6 +41,8 @@ _HOST_TTL = 600.0
 
 # one resource may not use more disk than this; a runner has about 14 GB free
 MAX_RESOURCE_BYTES = 6 * 1024 ** 3
+# ... and may not keep the crawler busy for longer than this, whatever the speed of the host
+MAX_RESOURCE_SECONDS = 25 * 60.0
 _CHUNK_SIZE = 1 << 20
 
 
@@ -143,11 +145,18 @@ class Fetcher:
         self._public_hosts: Dict[str, float] = {}
         self.resource_limit: Optional[int] = None
         self.resource_bytes = 0
+        self.resource_deadline: Optional[float] = None
 
-    def begin_resource(self, limit: Optional[int] = MAX_RESOURCE_BYTES):
-        """Start a new download budget; ``download`` raises ``TooLarge`` when it is used up."""
+    def begin_resource(self, limit: Optional[int] = MAX_RESOURCE_BYTES, seconds: Optional[float] = MAX_RESOURCE_SECONDS):
+        """Start a new download budget; ``download`` raises ``TooLarge`` when the bytes are used up and
+        ``ResourceTransient`` when the time is."""
         self.resource_limit = limit
         self.resource_bytes = 0
+        self.resource_deadline = time.time() + seconds if seconds else None
+
+    def _check_time(self, url: str):
+        if self.resource_deadline is not None and time.time() > self.resource_deadline:
+            raise ResourceTransient(f'{url!r}: the resource used up its time budget')
 
     def check_public(self, url: str):
         """Refuse anything but http(s) URLs on public hosts, so scraped links cannot reach internal services."""
@@ -236,6 +245,7 @@ class Fetcher:
     def download(self, url: str, dest: str, *, reject_html: bool = True, **kwargs) -> DownloadInfo:
         """Stream ``url`` into ``dest``; raise instead of leaving a partial or HTML file behind."""
         os.makedirs(os.path.dirname(dest) or '.', exist_ok=True)
+        self._check_time(url)
         resp = self.request('GET', url, stream=True, **kwargs)
         try:
             content_type = resp.headers.get('Content-Type', '')
@@ -252,11 +262,12 @@ class Fetcher:
             try:
                 with open(dest, 'wb') as f:
                     for chunk in resp.iter_content(_CHUNK_SIZE):
+                        self._check_time(url)
                         written += len(chunk)
                         if self.resource_limit and self.resource_bytes + written > self.resource_limit:
                             raise TooLarge(f'{url!r} went over the resource budget')
                         f.write(chunk)
-            except TooLarge:
+            except (TooLarge, ResourceTransient):
                 _remove(dest)
                 raise
             except (requests.ConnectionError, requests.Timeout, requests.exceptions.ChunkedEncodingError) as err:

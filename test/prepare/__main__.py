@@ -33,17 +33,17 @@ def newest(budget_minutes, poll_seconds, bootstrap, max_skeb_requests, skeb_inte
     from .http import Fetcher
     from .runner import Runner, RunConfig
     from .store import Store, LeaseUnavailable
-    from .ci import github_run_finished
+    from .ci import github_run_status
 
     _ensure_repository()
     store = Store(hf_client, _REPOSITORY)
-    store.holder_finished = github_run_finished
+    store.holder_status = github_run_status
     runner = Runner(
         store=store,
         skeb=SkebClient(min_interval=skeb_interval),
         fx=Fetcher(),
         config=RunConfig(budget_seconds=budget_minutes * 60, poll_interval=poll_seconds, bootstrap=bootstrap,
-                         max_skeb_requests=max_skeb_requests, once=once),
+                         max_skeb_requests=max_skeb_requests, once=once, hard_deadline=True),
     )
     # a cancelled workflow sends SIGTERM; turning it into SystemExit lets the run release its lease
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))

@@ -676,7 +676,7 @@ class TestLeaseOfAFinishedRun:
         client.files['state/lease.json'] = json.dumps({'holder': 'old-1', 'at': time.time(), 'run': '12345'}).encode()
         store = MemStore()
         store.client = client
-        store.holder_finished = lambda run_id: run_id == '12345'
+        store.holder_status = lambda run_id: 'completed' if run_id == '12345' else None
         waits = []
         store.acquire_lease('new-2', sleep=waits.append)
         assert store.read_lease()['holder'] == 'new-2' and 30.0 not in waits  # no waiting between attempts
@@ -688,15 +688,51 @@ class TestLeaseOfAFinishedRun:
         client.files['state/lease.json'] = json.dumps({'holder': 'old-1', 'at': time.time(), 'run': '12345'}).encode()
         store = MemStore()
         store.client = client
-        store.holder_finished = lambda run_id: False
+        store.holder_status = lambda run_id: 'in_progress'
         with pytest.raises(LeaseUnavailable):
             store.acquire_lease('new-2', wait_limit=0.0, sleep=lambda s: None)
 
-    def test_the_github_check_is_conservative(self, monkeypatch):
+    def test_a_holder_whose_run_is_still_going_is_only_waited_for_briefly(self):
+        import json
+        from test.prepare.store import LeaseUnavailable
+        client = FakeClient()
+        client.files['state/lease.json'] = json.dumps({'holder': 'old-1', 'at': time.time(), 'run': '12345'}).encode()
+        store = MemStore()
+        store.client = client
+        store.holder_status = lambda run_id: 'in_progress'
+        started = time.time()
+        with pytest.raises(LeaseUnavailable):
+            store.acquire_lease('new-2', alive_wait=0.0, sleep=lambda s: None)  # the long wait limit must not apply
+        assert time.time() - started < 5
+
+    def test_an_unknown_holder_is_waited_for_until_it_expires(self):
+        import json
+        from test.prepare.store import LeaseUnavailable
+        client = FakeClient()
+        client.files['state/lease.json'] = json.dumps({'holder': 'laptop', 'at': time.time(), 'run': ''}).encode()
+        store = MemStore()
+        store.client = client
+        waits = []
+        with pytest.raises(LeaseUnavailable):
+            store.acquire_lease('new-2', wait_limit=0.5, alive_wait=0.0, sleep=lambda s: (waits.append(s), time.sleep(0.3)))
+        assert waits.count(30.0) >= 1  # it did wait, because nothing says that laptop is gone
+
+    def test_release_is_one_write_and_only_for_the_holder(self):
+        client = FakeClient()
+        store = MemStore()
+        store.client = client
+        store.acquire_lease('run-1', sleep=lambda s: None)
+        before = len(client.commits)
+        store.release_lease('run-1')
+        assert len(client.commits) == before + 1  # no read-then-write round trips that a kill could cut short
+        store.release_lease('run-1')
+        assert len(client.commits) == before + 1  # and not twice
+
+    def test_the_github_status_check_is_conservative(self, monkeypatch):
         import requests as rq
         from test.prepare import ci
         monkeypatch.delenv('GITHUB_REPOSITORY', raising=False)
-        assert ci.github_run_finished('123') is False  # not on GitHub: unknown means not finished
+        assert ci.github_run_status('123') is None  # not on GitHub: unknown
         monkeypatch.setenv('GITHUB_REPOSITORY', 'a/b')
         monkeypatch.setenv('GITHUB_TOKEN', 'x')
 
@@ -708,15 +744,107 @@ class TestLeaseOfAFinishedRun:
                 return self._body
 
         monkeypatch.setattr(ci.requests, 'get', lambda *a, **k: Resp(200, {'status': 'completed'}))
-        assert ci.github_run_finished('123') is True
+        assert ci.github_run_status('123') == 'completed'
         monkeypatch.setattr(ci.requests, 'get', lambda *a, **k: Resp(200, {'status': 'in_progress'}))
-        assert ci.github_run_finished('123') is False
+        assert ci.github_run_status('123') == 'in_progress'
         monkeypatch.setattr(ci.requests, 'get', lambda *a, **k: Resp(404, {}))
-        assert ci.github_run_finished('123') is False
+        assert ci.github_run_status('123') is None
 
         def boom(*a, **k):
             raise rq.ConnectionError('x')
 
         monkeypatch.setattr(ci.requests, 'get', boom)
-        assert ci.github_run_finished('123') is False
-        assert ci.github_run_finished('local') is False  # not a numeric run id
+        assert ci.github_run_status('123') is None
+        assert ci.github_run_status('local') is None  # not a numeric run id
+
+
+@pytest.mark.unittest
+class TestEndingSafely:
+    def test_the_hard_deadline_ends_the_run_with_code_5(self):
+        with pytest.raises(SystemExit) as info:
+            Runner._on_hard_deadline(None, None)
+        assert info.value.code == 5
+
+    def test_arming_sets_an_alarm_after_the_budget_and_a_forced_exit_after_that(self, env, monkeypatch):
+        site, clock, make = env
+        runner, store, skeb = make(paths(1), {})
+        runner.config.budget_seconds, runner.config.hard_extra = 1000, 600
+        seen = {}
+        monkeypatch.setattr('test.prepare.runner.signal.signal', lambda sig, handler: seen.setdefault('handler', handler))
+        monkeypatch.setattr('test.prepare.runner.signal.alarm', lambda n: seen.setdefault('alarm', n))
+
+        class FakeTimer:
+            def __init__(self, interval, function, args):
+                seen['force_after'], seen['force_with'] = interval, args
+
+            daemon = False
+
+            def start(self):
+                seen['started'] = True
+
+            def cancel(self):
+                seen['cancelled'] = True
+
+        monkeypatch.setattr('test.prepare.runner.threading.Timer', FakeTimer)
+        runner._arm_hard_deadline()
+        assert seen['alarm'] == 1600 and seen['force_after'] == 1690 and seen['force_with'] == (5,) and seen['started']
+        runner._disarm_hard_deadline()
+        assert seen['cancelled']
+
+    def test_a_cancelled_run_releases_the_lease_on_the_way_out(self, env):
+        site, clock, make = env
+        runner, store, skeb = make(paths(1), {})
+        runner.use_lease = True
+        runner.sleep = lambda s: None
+        store.acquire_lease = lambda holder, **kw: setattr(store, '_holding', holder)
+        released = []
+        store.release_lease = lambda holder: released.append(holder)
+        store.keep_lease = lambda holder: True
+
+        def killed(*a, **k):
+            raise SystemExit(143)  # what SIGTERM turns into
+
+        runner.cycle = killed
+        with pytest.raises(SystemExit):
+            runner.run()
+        assert released == [runner.holder]
+
+    def test_a_hub_outage_while_saving_state_does_not_end_the_crawler(self, env, monkeypatch):
+        site, clock, make = env
+        monkeypatch.setattr('test.prepare.store.time.sleep', lambda s: None)
+        runner, store, skeb = make(paths(2), {p: 'no links' for p in paths(2)})
+        store.client.fail_commits = 1000
+        runner.cycle()  # must not raise
+        assert store.dirty  # nothing was lost, the state is still waiting to be written
+        store.client.fail_commits = 0
+        runner._flush()
+        assert not store.dirty
+
+    def test_a_resource_that_takes_too_long_is_given_up_for_a_retry(self, tmp_path, monkeypatch):
+        import socket
+        import requests
+        from test.prepare.errors import ResourceTransient
+        from test.prepare.http import Fetcher
+        monkeypatch.setattr(socket, 'getaddrinfo', lambda host, port: [(2, 1, 6, '', ('93.184.216.34', 0))])
+        fx = Fetcher(gap=0)
+
+        class Slow(requests.Response):
+            def iter_content(self, size):
+                yield b'x' * 10
+                yield b'x' * 10
+
+        def fake_request(method, url, allow_redirects, **kwargs):
+            import io
+            resp = Slow()
+            resp.raw = io.BytesIO(b'')
+            resp.status_code = 200
+            resp.headers['Content-Type'] = 'image/png'
+            resp.url = url
+            return resp
+
+        monkeypatch.setattr(fx.session, 'request', fake_request)
+        fx.begin_resource(seconds=1)
+        fx.resource_deadline = time.time() - 1  # the time budget has run out
+        with pytest.raises(ResourceTransient):
+            fx.download('https://example.com/a.png', str(tmp_path / 'a'))
+        assert not (tmp_path / 'a').exists()

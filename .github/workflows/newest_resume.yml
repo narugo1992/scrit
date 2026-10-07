@@ -1,14 +1,25 @@
 #file: noinspection YAMLSchemaValidation
 name: Newest resume
 
-# Safety net for the self-chaining Newest workflow. It is an event (a run finished), not a cron entry, so it does
-# not suffer from GitHub's delayed schedules. Normally the finished run has dispatched its successor already and
-# this does nothing.
+# Safety net for the self-chaining Newest workflow. It acts when a Newest run finishes (an event, so it does not
+# suffer from GitHub's delayed schedules) and, as a third layer, on a cron entry that may fire late or not at all.
+# Normally a finished run has dispatched its successor already and this does nothing.
+#
+# What it decides, from facts that hold whatever way the run ended (GitHub reports a job that hit the 6 hour limit
+# as failed or cancelled depending on the day, so the conclusion alone is not trusted):
+# - another Newest run is active or queued: nothing to do
+# - the last run was cancelled before it could have used its budget: somebody stopped it on purpose, stay stopped
+# - the last run was a debugging run: nothing to do
+# - the last run failed within 15 minutes: wait 20 minutes, then start again (never a tight crash loop, never
+#   given up either)
+# - anything else (success, an error after a long run, killed at the time limit, lost runner): start a run
 
 on:
   workflow_run:
     workflows: [Newest]
     types: [completed]
+  schedule:
+    - cron: '37 */3 * * *'
 
 permissions:
   actions: write
@@ -18,30 +29,50 @@ jobs:
   resume:
     name: Start a run if none is going
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    # a cancelled run is a deliberate stop; (once) and (no chain) runs are debugging runs
-    if: ${{ github.event.workflow_run.conclusion != 'cancelled' && !contains(github.event.workflow_run.display_title, '(once)') && !contains(github.event.workflow_run.display_title, '(no chain)') }}
+    timeout-minutes: 45
     steps:
       - name: Resume
         env:
           GH_TOKEN: ${{ github.token }}
-          FINISHED: ${{ github.event.workflow_run.id }}
-          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
-          STARTED_AT: ${{ github.event.workflow_run.run_started_at }}
-          ENDED_AT: ${{ github.event.workflow_run.updated_at }}
+          REPO: ${{ github.repository }}
         shell: bash
         run: |
-          others=$(gh run list -R "${{ github.repository }}" --workflow newest.yml --limit 20 --json databaseId,status \
-            --jq "[.[] | select(.databaseId != $FINISHED) | select(.status == \"in_progress\" or .status == \"queued\" or .status == \"pending\" or .status == \"waiting\")] | length")
-          echo "finished run $FINISHED ($CONCLUSION), other active newest runs: $others"
-          if [ "$others" -gt 0 ]; then
-            echo "a run is already going or queued, nothing to do"
+          active() {
+            gh run list -R "$REPO" --workflow newest.yml --limit 20 --json status \
+              --jq '[.[] | select(.status == "in_progress" or .status == "queued" or .status == "pending" or .status == "waiting" or .status == "requested")] | length'
+          }
+          if [ "$(active)" -gt 0 ]; then
+            echo "a newest run is already going or queued, nothing to do"
             exit 0
           fi
-          lasted=$(( $(date -d "$ENDED_AT" +%s) - $(date -d "$STARTED_AT" +%s) ))
-          if [ "$CONCLUSION" = "failure" ] && [ "$lasted" -lt 900 ]; then
-            echo "::warning::the last run failed after ${lasted}s, not restarting (a crash loop would only burn minutes)"
-            exit 0
+
+          last=$(gh run list -R "$REPO" --workflow newest.yml --status completed --limit 1 \
+            --json databaseId,conclusion,displayTitle,startedAt,updatedAt --jq '.[0] // empty')
+          if [ -n "$last" ]; then
+            title=$(jq -r .displayTitle <<<"$last")
+            conclusion=$(jq -r .conclusion <<<"$last")
+            lasted=$(( $(date -d "$(jq -r .updatedAt <<<"$last")" +%s) - $(date -d "$(jq -r .startedAt <<<"$last")" +%s) ))
+            echo "last run: $(jq -r .databaseId <<<"$last") '$title' $conclusion after ${lasted}s"
+            case "$title" in
+              *"(once)"*|*"(no chain)"*) echo "a debugging run, nothing to do"; exit 0 ;;
+            esac
+            if [ "$conclusion" = "cancelled" ] && [ "$lasted" -lt 19800 ]; then
+              echo "cancelled before its budget was used: stopped on purpose, staying stopped"
+              exit 0
+            fi
+            if [ "$conclusion" != "success" ] && [ "$lasted" -lt 900 ]; then
+              echo "::warning::the last run ended with '$conclusion' after ${lasted}s, starting again in 20 minutes"
+              sleep 1200
+              if [ "$(active)" -gt 0 ]; then echo "a run appeared meanwhile"; exit 0; fi
+            fi
           fi
-          echo "::notice::no newest run is active, starting one"
-          gh workflow run newest.yml -R "${{ github.repository }}"
+
+          for attempt in 1 2 3 4 5; do
+            if gh workflow run newest.yml -R "$REPO"; then
+              echo "::notice::no newest run was active, started one"
+              exit 0
+            fi
+            sleep $(( attempt * 20 ))
+          done
+          echo "::error::could not start a newest run"
+          exit 1
