@@ -94,3 +94,21 @@ class TestIdsAreAscii:
     def test_japanese_text_glued_to_a_folder_link_is_not_part_of_the_id(self):
         url = 'https://drive.google.com/drive/folders/1qr-WAGRFTPpRG06V8xVN6NNUmxIrqyx5の闘麗装'
         assert google.match(url) == 'googledrive_1qr-WAGRFTPpRG06V8xVN6NNUmxIrqyx5'
+
+
+@pytest.mark.unittest
+class TestDocumentExports:
+    def test_drawings_are_recognised_and_exported_as_png(self, monkeypatch):
+        url = 'https://docs.google.com/drawings/d/1KKv_e7sGB2ztkg5JpU0Xe_Tk9BN99_RC9RPKGouNjSc/edit?usp=drive_link'
+        assert google.match(url) == 'googledrive_1KKv_e7sGB2ztkg5JpU0Xe_Tk9BN99_RC9RPKGouNjSc'
+        fetched = []
+        monkeypatch.setattr(google, 'fetch_file', lambda fx, u, out_dir, name=None, **kw: fetched.append((u, name)))
+        google.download(None, url, '/tmp/x')
+        assert fetched == [('https://docs.google.com/drawings/d/1KKv_e7sGB2ztkg5JpU0Xe_Tk9BN99_RC9RPKGouNjSc/export/png',
+                            '1KKv_e7sGB2ztkg5JpU0Xe_Tk9BN99_RC9RPKGouNjSc.png')]
+
+    def test_documents_keep_the_format_query(self, monkeypatch):
+        fetched = []
+        monkeypatch.setattr(google, 'fetch_file', lambda fx, u, out_dir, name=None, **kw: fetched.append(u))
+        google.download(None, 'https://docs.google.com/document/d/1ocFPNA0ZOjPxtKJFv-DFJDj4M0XLuBXa/edit', '/tmp/x')
+        assert fetched == ['https://docs.google.com/document/d/1ocFPNA0ZOjPxtKJFv-DFJDj4M0XLuBXa/export?format=docx']

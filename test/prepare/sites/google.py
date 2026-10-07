@@ -20,6 +20,7 @@ _DOC_EXPORT = {
     'application/vnd.google-apps.document': ('document', 'docx'),
     'application/vnd.google-apps.spreadsheet': ('spreadsheets', 'xlsx'),
     'application/vnd.google-apps.presentation': ('presentation', 'pptx'),
+    'application/vnd.google-apps.drawing': ('drawings', 'png'),
 }
 _MAX_DRIVE_API_DEPTH = 5
 
@@ -33,7 +34,7 @@ def parse(url: str) -> Optional[Tuple[str, str]]:
     for pattern, kind in [
         (rf'/folders/({_ID})', 'folder'),
         (rf'/file/d/({_ID})', 'file'),
-        (rf'/(document|spreadsheets|presentation)/d/({_ID})', None),
+        (rf'/(document|spreadsheets|presentation|drawings)/d/({_ID})', None),
     ]:
         matching = re.search(pattern, parsed.path)
         if matching:
@@ -194,7 +195,9 @@ def _download_entry(fx: Fetcher, file_id: str, out_dir: str, name: Optional[str]
     os.makedirs(out_dir, exist_ok=True)
     if mime in _DOC_EXPORT:
         kind, fmt = _DOC_EXPORT[mime]
-        url = f'https://docs.google.com/{kind}/d/{file_id}/export?format={fmt}'
+        # drawings export as /export/<format>, the other documents take a format query
+        url = (f'https://docs.google.com/{kind}/d/{file_id}/export/{fmt}' if kind == 'drawings'
+               else f'https://docs.google.com/{kind}/d/{file_id}/export?format={fmt}')
         try:
             fetch_file(fx, url, out_dir, f'{os.path.splitext(name)[0]}.{fmt}')
         except UnexpectedResponse as err:
