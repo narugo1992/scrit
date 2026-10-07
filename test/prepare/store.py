@@ -45,6 +45,7 @@ class Store:
         self._dirty_state = False
         self._dirty_pending = False
         self._index_loaded_at = 0.0
+        self.last_commit_at = time.time()
 
     # ------------------------------------------------------------ reading
     def _read_json(self, path: str, default):
@@ -171,3 +172,4 @@ class Store:
 
         self.unarchived.update(zips)
         self._dirty_state = self._dirty_pending = False
+        self.last_commit_at = time.time()

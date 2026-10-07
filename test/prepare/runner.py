@@ -53,6 +53,7 @@ class RunConfig:
     bootstrap: int = 400
     max_skeb_requests: int = 4500
     flush_every: int = 20
+    flush_seconds: float = 120.0
     retry_batch: int = 20
     max_extra_posts: int = 100
     once: bool = False
@@ -219,7 +220,8 @@ class Runner:
             self._handle_jobs(jobs, f'newest: {path} +{len(jobs)} resource(s)')
         else:
             self._posts_since_flush += 1
-            if self._posts_since_flush >= self.config.flush_every:
+            idle = time.time() - self.store.last_commit_at
+            if self._posts_since_flush >= self.config.flush_every or idle >= self.config.flush_seconds:
                 self.store.commit({}, 'newest: update state')
                 self._posts_since_flush = 0
 

@@ -1,4 +1,5 @@
 import os
+import time
 from typing import Dict, List
 
 import pytest
@@ -290,3 +291,32 @@ class TestDiscovery:
         runner, store, skeb = make(listing, {'/@a/works/10': 'https://www.example.org/x https://example.org/y'})
         runner.cycle()
         assert store.state['unsupported_hosts'] == {'example.org': 2}
+
+
+@pytest.mark.unittest
+class TestFailureListIsCommittedWithEveryUpload:
+    def test_failure_is_committed_in_the_same_pass_as_the_post(self, env):
+        site, clock, make = env
+        listing = paths(1)
+        site.behaviour = {'https://fake.test/flaky': ResourceTransient('net')}
+        runner, store, skeb = make(listing, {listing[0]: 'https://fake.test/flaky'})
+        runner.cycle()
+        commits = store.client.commits
+        assert commits and 'state/pending.json' in commits[0]['paths']  # not postponed to the end of the run
+        assert not any(p.startswith('unarchived/') for p in commits[0]['paths'])
+
+    def test_upload_commit_always_carries_state_and_pending(self, env):
+        site, clock, make = env
+        listing = paths(1)
+        runner, store, skeb = make(listing, {listing[0]: 'https://fake.test/good'})
+        runner.cycle()
+        first = store.client.commits[0]
+        assert {'unarchived/fake_good.zip', 'state/newest.json', 'state/pending.json'} <= set(first['paths'])
+
+    def test_cursor_is_flushed_after_a_quiet_period_even_without_resources(self, env):
+        site, clock, make = env
+        listing = paths(3)
+        runner, store, skeb = make(listing, {}, flush_every=1000)
+        store.last_commit_at = time.time() - 1000
+        runner.process_post(listing[0])
+        assert any('state/newest.json' in c['paths'] for c in store.client.commits)

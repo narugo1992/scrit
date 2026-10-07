@@ -211,7 +211,7 @@ class gphotos(_Site):
         _fetch_all(fx, [f'{item}=d' for item in bases[:300]], out_dir, 'photo', '.jpg')
 
 
-_DIRECT_HOSTS = {'i.pinimg.com', 'file.garden', 'hstorage.io', 'ul.h3z.jp', 'free.picui.cn',
+_DIRECT_HOSTS = {'cdn.donmai.us', 'i.pinimg.com', 'file.garden', 'hstorage.io', 'ul.h3z.jp', 'free.picui.cn',
                  'livedoor.blogimg.jp', 'f2.toyhou.se'}
 
 
@@ -239,11 +239,14 @@ class direct(_Site):
             query = dict(parse_qsl(parsed.query))
             query['format'] = 'original'
             return _fetch_all_with_ua(fx, urlunsplit(parsed._replace(query=urlencode(query))), out_dir)
+        if host == 'cdn.donmai.us':
+            # Cloudflare in front of the CDN blocks browser-like user agents that lack a browser TLS fingerprint
+            return _fetch_all_with_ua(fx, url, out_dir)
         _fetch_all(fx, [url], out_dir, 'file')
 
 
 def _fetch_all_with_ua(fx: Fetcher, url: str, out_dir: str):
     try:
-        fetch_file(fx, url, out_dir, headers={'User-Agent': 'python-requests/2.32.3'})
+        fetch_file(fx, url, out_dir, headers={'User-Agent': 'curl/8.5.0'})
     except UnexpectedResponse as err:
         raise ResourceTransient(str(err)) from err
