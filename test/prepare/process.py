@@ -38,6 +38,8 @@ def write_zip(src_dir: str, zip_file: str, prefix: str = '') -> int:
 
 def build_zip(site, url: str, prefix: str, zip_file: str, fx: Fetcher):
     """Download ``url`` with ``site`` and pack it into ``zip_file``; raise ``NoContent`` for empty results."""
+    if fx is not None:
+        fx.begin_resource()
     with TemporaryDirectory() as td:
         site.download(fx, url, td)
         if write_zip(td, zip_file, prefix) == 0:

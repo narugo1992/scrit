@@ -1,3 +1,4 @@
+import logging
 import os
 import zipfile
 from typing import Optional
@@ -12,7 +13,8 @@ from ..http import Fetcher
 NAME = 'dropbox'
 
 _HOSTS = {'dropbox.com', 'www.dropbox.com', 'dl.dropbox.com', 'dl-web.dropbox.com'}
-_PREFIXES = ({'scl', 'fi'}, {'scl', 'fo'})
+_MAX_MEMBERS = 5000
+_MAX_EXTRACT_BYTES = 4 * 1024 ** 3
 
 
 def _valid(segs) -> bool:
@@ -45,5 +47,9 @@ def download(fx: Fetcher, url: str, out_dir: str):
         raise ResourceGone(f'dropbox link not downloadable: {err}') from err
     if os.path.splitext(target)[1].lower() == '.zip' and zipfile.is_zipfile(target):
         with zipfile.ZipFile(target, 'r') as zf:
+            infos = zf.infolist()
+            if len(infos) > _MAX_MEMBERS or sum(item.file_size for item in infos) > _MAX_EXTRACT_BYTES:
+                logging.warning(f'{target!r} is too big to unpack ({len(infos)} members), kept as a zip.')
+                return
             zf.extractall(out_dir)
         os.remove(target)

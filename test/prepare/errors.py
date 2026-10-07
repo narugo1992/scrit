@@ -31,3 +31,11 @@ class UnexpectedResponse(GenericException):
         self.content_type = content_type
         self.snippet = snippet
         self.url = url
+
+
+class UnsafeUrl(ResourceGone):
+    """The URL points somewhere we refuse to fetch from (non-http scheme, IP literal, private network)."""
+
+
+class TooLarge(ResourceGone):
+    """The resource exceeds the per-resource download budget."""

@@ -56,6 +56,8 @@ class bsky:
         did_doc = fx.get(f'https://plc.directory/{did}').json() if did.startswith('did:plc:') else {}
         pds = next((item['serviceEndpoint'] for item in did_doc.get('service') or []
                     if item.get('id') == '#atproto_pds'), None)
+        if pds and not pds.startswith('https://'):
+            pds = None
         items = []
         for index, image in enumerate(images, start=1):
             cid = image['fullsize'].split('/')[-1].split('@')[0]
