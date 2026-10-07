@@ -364,7 +364,7 @@ class TestSkebHiccups:
             def json(self):
                 return {'ok': True}
 
-        def flaky_get(url, params=None):
+        def flaky_get(url, params=None, timeout=None):
             calls.append(url)
             if len(calls) == 1:
                 raise requests.ConnectionError('closed')
@@ -378,7 +378,56 @@ class TestSkebHiccups:
     def test_client_gives_up_after_the_second_failure(self, monkeypatch):
         from pyskeb.client.client import SkebClient
         client = SkebClient()
-        monkeypatch.setattr(client._session, 'get', lambda url, params=None: (_ for _ in ()).throw(requests.ConnectionError('x')))
+        monkeypatch.setattr(client._session, 'get', lambda url, params=None, timeout=None: (_ for _ in ()).throw(requests.ConnectionError('x')))
         monkeypatch.setattr('pyskeb.client.client.time.sleep', lambda s: None)
         with pytest.raises(requests.ConnectionError):
             client._get('/api/works')
+
+
+@pytest.mark.unittest
+class TestSkebTimeouts:
+    def test_every_request_has_a_timeout(self, monkeypatch):
+        from pyskeb.client.client import SkebClient
+        client = SkebClient()
+        seen = {}
+
+        class Resp:
+            status_code = 200
+            cookies = {}
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return []
+
+        def get(url, params=None, timeout=None):
+            seen['timeout'] = timeout
+            return Resp()
+
+        monkeypatch.setattr(client._session, 'get', get)
+        client._get('/api/works')
+        assert seen['timeout'] == (10, 60)
+
+    def test_idle_connections_are_dropped_before_the_next_request(self, monkeypatch):
+        from pyskeb.client.client import SkebClient
+        client = SkebClient()
+        closed = []
+
+        class Resp:
+            status_code = 200
+            cookies = {}
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return []
+
+        monkeypatch.setattr(client._session, 'get', lambda url, params=None, timeout=None: Resp())
+        monkeypatch.setattr(client._session, 'close', lambda: closed.append(1))
+        client._last_request = time.time() - 600
+        client._get('/api/works')
+        assert closed == [1]
+        client._get('/api/works')
+        assert closed == [1]  # a request right after another one keeps the connection

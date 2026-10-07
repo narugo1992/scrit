@@ -21,7 +21,7 @@ class SkebClient:
     ``SkebRateLimitError`` is raised instead of retrying, so a caller can never hammer the site.
     """
 
-    def __init__(self, min_interval: float = 0.0):
+    def __init__(self, min_interval: float = 0.0, timeout=(10, 60), idle_reset: float = 30.0):
         self._session = requests.session()
         self._session.headers.update({
             'Referer': 'https://skeb.jp',
@@ -30,10 +30,16 @@ class SkebClient:
             "Accept": "application/json, text/plain, */*",
         })
         self.min_interval = min_interval
+        self.timeout = timeout
+        self.idle_reset = idle_reset
         self.request_count = 0
         self._last_request = 0.0
 
     def _pace(self):
+        # Skeb drops idle keep-alive connections without telling us, and a request on such a connection can hang
+        # for many minutes when it has no timeout. A poll every few minutes always finds the pool stale.
+        if time.time() - self._last_request > self.idle_reset:
+            self._session.close()
         wait = self._last_request + self.min_interval - time.time()
         if wait > 0:
             time.sleep(wait)
@@ -41,12 +47,12 @@ class SkebClient:
 
     def _send(self, url, params):
         try:
-            return self._session.get(url, params=params)
+            return self._session.get(url, params=params, timeout=self.timeout)
         except (requests.ConnectionError, requests.Timeout):
-            # the server drops idle keep-alive connections; one retry on a fresh connection is not extra load
+            # one retry on a fresh connection is not extra load
             self._session.close()
             time.sleep(5.0)
-            return self._session.get(url, params=params)
+            return self._session.get(url, params=params, timeout=self.timeout)
 
     def _get(self, url, params=None):
         for attempt in range(3):
