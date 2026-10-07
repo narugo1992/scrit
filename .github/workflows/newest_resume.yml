@@ -46,8 +46,11 @@ jobs:
             exit 0
           fi
 
-          last=$(gh run list -R "$REPO" --workflow newest.yml --status completed --limit 1 \
-            --json databaseId,conclusion,displayTitle,startedAt,updatedAt --jq '.[0] // empty')
+          # the status filter of the runs API returns months old runs while GitHub is degraded, so take the latest runs
+          # unfiltered and pick the newest finished one here
+          last=$(gh run list -R "$REPO" --workflow newest.yml --limit 15 \
+            --json databaseId,status,conclusion,displayTitle,startedAt,updatedAt \
+            --jq '[.[] | select(.status == "completed")] | max_by(.databaseId) // empty')
           if [ -n "$last" ]; then
             title=$(jq -r .displayTitle <<<"$last")
             conclusion=$(jq -r .conclusion <<<"$last")

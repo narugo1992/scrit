@@ -12,8 +12,9 @@ WORKFLOW = os.path.join(os.path.dirname(__file__), '..', '..', '.github', 'workf
 FAKE_GH = '''#!/bin/bash
 # stands in for the gh cli: answers from the environment and records what would have been started
 case "$*" in
-  *"--status completed"*) [ -n "$LAST_JSON" ] && echo "$LAST_JSON" ;;
   *"workflow run"*) echo "DISPATCHED" ;;
+  *"--status"*) echo "the status filter must not be used: it returns stale runs" >&2; exit 9 ;;
+  *"conclusion"*) [ -n "$LAST_JSON" ] && echo "$LAST_JSON" ;;
   *"run list"*)
     read -r first rest < "$SEQ_FILE"
     echo "${first:-0}"
