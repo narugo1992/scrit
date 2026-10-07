@@ -1,3 +1,4 @@
+import signal
 import sys
 
 import click
@@ -31,7 +32,7 @@ def newest(budget_minutes, poll_seconds, bootstrap, max_skeb_requests, skeb_inte
     from .base import _REPOSITORY, hf_client, _ensure_repository
     from .http import Fetcher
     from .runner import Runner, RunConfig
-    from .store import Store
+    from .store import Store, LeaseUnavailable
 
     _ensure_repository()
     runner = Runner(
@@ -41,7 +42,13 @@ def newest(budget_minutes, poll_seconds, bootstrap, max_skeb_requests, skeb_inte
         config=RunConfig(budget_seconds=budget_minutes * 60, poll_interval=poll_seconds, bootstrap=bootstrap,
                          max_skeb_requests=max_skeb_requests, once=once),
     )
-    runner.run()
+    # a cancelled workflow sends SIGTERM; turning it into SystemExit lets the run release its lease
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    try:
+        runner.run()
+    except LeaseUnavailable as err:
+        print(f'Another crawler is running ({err}), this one stops without doing anything.', flush=True)
+        sys.exit(4)
     print(runner.summary(), flush=True)
     sys.exit(1 if runner.bugs else 0)
 

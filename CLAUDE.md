@@ -227,8 +227,9 @@ make unittest COV_TYPES="xml term-missing" # with coverage
 
 **1. Polling and state** (`runner.py`, `store.py`)
 - `Runner.run()` polls the newest-works listing (every 10 minutes), processes new posts oldest first, then works the retry queue
-- the cursor is a list of recently processed post paths (`state/newest.json` → `head`); a poll stops at three consecutive known posts. Skeb keeps about 3.5 days (offset ≈ 3900) of listing, so the crawler has to run at least that often
+- **newest first**: every poll puts the posts it has not seen in FRONT of `state/newest.json` → `backlog` (posts still waiting, persisted); `head` is the list of recently listed posts (the poll stops at three consecutive posts that are in `head` or `backlog`). The backlog is worked newest first, and a poll is repeated every poll interval even in the middle of a long backlog, so posts that appear meanwhile overtake the older ones. Only when no fresh post is left does a round go on to the retry queue, and last to the older works that posts link to. An interrupted run loses nothing: what is left stays in the backlog. Skeb keeps about 3.5 days (offset ≈ 3900) of listing, so the crawler has to run at least that often
 - `Store` keeps the dedupe indexes (`archived.json` + `unarchived/`) and writes every upload as ONE commit that also carries the state files (`state/newest.json`, `state/pending.json`). `packs/`, `archived.json`, `index.json` and `README.md` belong to the repacker and are never written by `newest`; downstream only reads the repacker's zips
+- one crawler at a time: the workflow concurrency group queues a dispatched run until the previous one ended, and the crawler holds a lease in `state/lease.json` (write, wait 20s, read back; the hub does NOT enforce `parent_commit`, so there is no atomic lock; refreshed every 5 min, expires after 45 min). Exit code 4 = lease held by a live crawler
 - failures go to `state/pending.json` with growing delays (1h, 6h, 1d, 3d, 7d, 14d), a blocked host is cooled down (25 min) and its remaining resources are queued without being tried
 - skeb.jp is paced (2.5s between requests, at most 4500 per run); a 429 pauses all skeb requests for 2h/4h/8h/12h (stored in the state) and never triggers retries
 - works linked from posts (`skeb.jp/@user/works/N`) are crawled once as an extra source, without moving the cursor
@@ -282,7 +283,8 @@ make unittest COV_TYPES="xml term-missing" # with coverage
 
 ## GitHub Actions Workflows (authorized)
 
-- `newest.yml` — long-running crawl: one run polls for up to 330 minutes and dispatches the next run itself (`GITHUB_TOKEN` dispatches are not delayed by GitHub's degraded schedule); the cron entry is only a watchdog guarded by a `guard` job, and the `newest` job holds a concurrency group so only one crawler runs
+- `newest.yml` — long-running crawl: one run polls for up to 330 minutes and dispatches the next run itself (`GITHUB_TOKEN` dispatches are not delayed by GitHub's degraded schedule); no cron entry. `newest_resume.yml` is triggered when a Newest run finishes and starts a new one only if none is active, the run did not crash within 15 minutes, and it was not cancelled (cancel = stop the crawler). The `newest` job holds a concurrency group so only one crawler runs
+- `newest_resume.yml` — event-driven safety net for the chain (see above)
 - `repack.yml` — periodic repacking of unarchived files
 - `squash.yml` — archive consolidation
 - `artists.yml` — artist database updates

@@ -16,10 +16,18 @@ PENDING_PATH = 'state/pending.json'
 HEAD_SIZE = 600
 PENDING_LIMIT = 3000
 COMMIT_ATTEMPTS = 6
+LEASE_PATH = 'state/lease.json'
+LEASE_TTL = 45 * 60.0       # a holder that stopped refreshing this long ago is considered dead
+LEASE_SETTLE = 20.0         # time two contenders get to write before the winner is read back
+BACKLOG_LIMIT = 8000
 
 
 class CommitFailed(GenericException):
     pass
+
+
+class LeaseUnavailable(GenericException):
+    """Another crawler holds the lease and keeps refreshing it."""
 
 
 def _now_text() -> str:
@@ -80,6 +88,7 @@ class Store:
         self.state = self._read_json(STATE_PATH, {})
         self.state.setdefault('version', 1)
         self.state.setdefault('head', [])
+        self.state.setdefault('backlog', [])
         self.state.setdefault('stats', {})
         self.state.setdefault('skeb', {})
         self.pending = (self._read_json(PENDING_PATH, {}) or {}).get('items', [])
@@ -92,13 +101,28 @@ class Store:
     def head(self) -> List[str]:
         return self.state['head']
 
-    def push_head(self, path: str):
-        head = self.state['head']
-        if path in head:
-            head.remove(path)
-        head.insert(0, path)
-        del head[HEAD_SIZE:]
+    @property
+    def backlog(self) -> List[str]:
+        return self.state['backlog']
+
+    def known_posts(self) -> Set[str]:
+        """Posts that were listed already: the recent ones plus the ones still waiting to be processed."""
+        return set(self.state['head']) | set(self.state['backlog'])
+
+    def enqueue(self, paths: List[str]):
+        """Put newly listed posts (newest first) in front of everything that is already waiting."""
+        fresh = [path for path in dict.fromkeys(paths) if path not in self.known_posts()]
+        if not fresh:
+            return
+        self.state['backlog'] = (fresh + self.state['backlog'])[:BACKLOG_LIMIT]
+        self.state['head'] = (fresh + self.state['head'])[:HEAD_SIZE]
         self._dirty_state = True
+
+    def mark_done(self, path: str):
+        backlog = self.state['backlog']
+        if path in backlog:
+            backlog.remove(path)
+            self._dirty_state = True
 
     def bump(self, site: str, status: str, amount: int = 1):
         stats = self.state['stats']
@@ -154,6 +178,20 @@ class Store:
         return self._dirty_state or self._dirty_pending
 
     # ------------------------------------------------------------ writing
+    def _create_commit(self, operations, message: str):
+        for attempt in range(1, COMMIT_ATTEMPTS + 1):
+            try:
+                self.client.create_commit(repo_id=self.repo_id, repo_type='dataset', operations=operations,
+                                          commit_message=message)
+            except (HfHubHTTPError, requests.ConnectionError, requests.Timeout) as err:
+                if attempt == COMMIT_ATTEMPTS:
+                    raise CommitFailed(f'commit {message!r} failed {attempt} times: {err!r}') from err
+                delay = min(20 * 2 ** (attempt - 1), 300)
+                logging.warning(f'Commit failed ({err!r}), retry in {delay}s ({attempt}/{COMMIT_ATTEMPTS}) ...')
+                time.sleep(delay)
+            else:
+                return
+
     def commit(self, zips: Optional[Dict[str, str]] = None, message: str = 'newest: update state'):
         """One atomic commit with the new zips and the state files that changed."""
         zips = zips or {}
@@ -172,19 +210,52 @@ class Store:
                 path_or_fileobj=json.dumps({'version': 1, 'items': self.pending}, ensure_ascii=False,
                                            indent=1).encode('utf-8')))
 
-        for attempt in range(1, COMMIT_ATTEMPTS + 1):
-            try:
-                self.client.create_commit(repo_id=self.repo_id, repo_type='dataset', operations=operations,
-                                          commit_message=message)
-            except (HfHubHTTPError, requests.ConnectionError, requests.Timeout) as err:
-                if attempt == COMMIT_ATTEMPTS:
-                    raise CommitFailed(f'commit {message!r} failed {attempt} times: {err!r}') from err
-                delay = min(20 * 2 ** (attempt - 1), 300)
-                logging.warning(f'Commit failed ({err!r}), retry in {delay}s ({attempt}/{COMMIT_ATTEMPTS}) ...')
-                time.sleep(delay)
-            else:
-                break
+        self._create_commit(operations, message)
 
         self.unarchived.update(zips)
         self._dirty_state = self._dirty_pending = False
         self.last_commit_at = time.time()
+
+    # ------------------------------------------------------------ lease
+    # The workflow's concurrency group is what really keeps a second crawler out. This lease is a second line
+    # for runs that bypass it (a manual run from a laptop, another workflow). The hub does not enforce
+    # parent_commit, so there is no compare-and-swap: contenders write, wait, and read back who won.
+    def read_lease(self) -> Dict:
+        return self._read_json(LEASE_PATH, {}) or {}
+
+    def _write_lease(self, holder: Optional[str]):
+        body = {'holder': holder, 'at': time.time(), 'run': os.environ.get('GITHUB_RUN_ID', '')}
+        self._create_commit(
+            [CommitOperationAdd(path_in_repo=LEASE_PATH, path_or_fileobj=json.dumps(body).encode('utf-8'))],
+            'newest: lease' if holder else 'newest: release the lease')
+
+    def _held_by_other(self, lease: Dict, holder: str) -> bool:
+        return bool(lease.get('holder')) and lease['holder'] != holder and time.time() - lease.get('at', 0) <= LEASE_TTL
+
+    def acquire_lease(self, holder: str, wait_limit: float = LEASE_TTL + 300,
+                      sleep=time.sleep, settle: float = LEASE_SETTLE):
+        deadline = time.time() + wait_limit
+        while True:
+            lease = self.read_lease()
+            if not self._held_by_other(lease, holder):
+                self._write_lease(holder)
+                sleep(settle)
+                if self.read_lease().get('holder') == holder:
+                    return
+                logging.warning('Another crawler wrote the lease at the same moment and won it.')
+            else:
+                logging.info(f'Lease held by {lease["holder"]!r} (refreshed {time.time() - lease["at"]:.0f}s ago), waiting ...')
+            if time.time() > deadline:
+                raise LeaseUnavailable(f'the lease is still held by {self.read_lease().get("holder")!r}')
+            sleep(30.0)
+
+    def keep_lease(self, holder: str) -> bool:
+        """Refresh the lease; False means another live crawler has taken over."""
+        if self._held_by_other(self.read_lease(), holder):
+            return False
+        self._write_lease(holder)
+        return True
+
+    def release_lease(self, holder: str):
+        if self.read_lease().get('holder') == holder:
+            self._write_lease(None)

@@ -16,6 +16,7 @@ class FakeClient:
     def __init__(self):
         self.commits: List[Dict] = []
         self.fail_commits = 0
+        self.files: Dict[str, bytes] = {}
 
     def create_commit(self, repo_id, repo_type, operations, commit_message):
         if self.fail_commits:
@@ -25,17 +26,22 @@ class FakeClient:
             'message': commit_message,
             'paths': [op.path_in_repo for op in operations],
         })
+        for op in operations:
+            if isinstance(op.path_or_fileobj, bytes):
+                self.files[op.path_in_repo] = op.path_or_fileobj
 
 
 class MemStore(Store):
     def __init__(self, archived=(), head=()):
         super().__init__(FakeClient(), 'user/repo')
         self.archived = set(archived)
-        self.state = {'version': 1, 'head': list(head), 'stats': {}, 'skeb': {}}
+        self.state = {'version': 1, 'head': list(head), 'backlog': [], 'stats': {}, 'skeb': {}}
         self._index_loaded_at = 1e18
 
     def _read_json(self, path, default):
-        return default
+        import json
+        raw = self.client.files.get(path)
+        return json.loads(raw) if raw is not None else default
 
     def load_state(self):
         pass
@@ -108,7 +114,7 @@ def env(monkeypatch):
         store = store or MemStore()
         skeb = FakeSkeb(listing, posts)
         cfg = RunConfig(budget_seconds=1000 * 24 * 3600, poll_interval=60, **config)
-        runner = Runner(store, skeb, None, cfg, clock=clock, sleep=clock.sleep)
+        runner = Runner(store, skeb, None, cfg, clock=clock, sleep=clock.sleep, use_lease=False)
         return runner, store, skeb
 
     return site, clock, make
@@ -120,14 +126,14 @@ def paths(n):
 
 @pytest.mark.unittest
 class TestRunner:
-    def test_posts_are_processed_oldest_first_and_cursor_moves(self, env):
+    def test_posts_are_processed_newest_first_and_cursor_covers_them(self, env):
         site, clock, make = env
         listing = paths(3)
         posts = {p: f'https://fake.test/r{i}' for i, p in enumerate(listing)}
         runner, store, skeb = make(listing, posts)
         runner.cycle()
-        assert site.calls == ['https://fake.test/r2', 'https://fake.test/r1', 'https://fake.test/r0']
-        assert store.head == listing  # newest first
+        assert site.calls == ['https://fake.test/r0', 'https://fake.test/r1', 'https://fake.test/r2']
+        assert store.head == listing and store.backlog == []  # newest first, nothing left waiting
         uploaded = [c for c in store.client.commits if any(p.startswith('unarchived/') for p in c['paths'])]
         assert len(uploaded) == 3
         # zips and state travel in the same commit
@@ -318,6 +324,7 @@ class TestFailureListIsCommittedWithEveryUpload:
         listing = paths(3)
         runner, store, skeb = make(listing, {listing[0]: 'no links here'}, flush_every=1000)
         store.last_commit_at = time.time() - 1000
+        store.enqueue([listing[0]])
         runner.process_post(listing[0])
         assert any('state/newest.json' in c['paths'] for c in store.client.commits)
 
@@ -470,3 +477,191 @@ class TestEmptyUnarchivedDirectory:
         store = Store(Client(), 'user/repo')
         store.refresh()  # must not raise
         assert store.unarchived == set() and store.archived == set()
+
+
+@pytest.mark.unittest
+class TestNewestHasPriority:
+    def test_new_posts_overtake_the_backlog_that_is_still_waiting(self, env):
+        site, clock, make = env
+        old = paths(6)[3:]               # three older posts that are already waiting
+        posts = {p: f'https://fake.test/{p[-1]}' for p in paths(6)}
+        runner, store, skeb = make(paths(6), posts)
+        store.state['head'] = list(old)
+        store.state['backlog'] = list(old)
+        runner.cycle()
+        assert [c.rsplit('/', 1)[1] for c in site.calls] == ['6', '5', '4', '3', '2', '1']  # newest ... oldest, all of it
+
+    def test_a_long_backlog_is_interrupted_by_polling_for_even_newer_posts(self, env):
+        site, clock, make = env
+        listing = paths(3)
+        posts = {p: f'https://fake.test/{p[-1]}' for p in paths(5)}
+        runner, store, skeb = make(listing, posts, )
+        runner.config.poll_interval = 60
+        original = runner.process_post
+        arrivals = {'done': False}
+
+        def slow_post(path, from_listing=True):
+            clock.now += 100  # every post takes longer than a poll interval
+            if not arrivals['done'] and path == '/@u3/works/3':
+                skeb.listing = paths(5)  # two newer posts appear while the first one is being processed
+                arrivals['done'] = True
+            return original(path, from_listing)
+
+        runner.process_post = slow_post
+        runner.cycle()
+        order = [c.rsplit('/', 1)[1] for c in site.calls]
+        assert order == ['3', '5', '4', '2', '1']  # 5 and 4 jumped ahead of the older 2 and 1
+
+    def test_an_interrupted_run_keeps_the_rest_and_the_next_run_still_goes_newest_first(self, env):
+        site, clock, make = env
+        listing = paths(4)
+        posts = {p: f'https://fake.test/{p[-1]}' for p in paths(6)}
+        runner, store, skeb = make(listing, posts)
+        runner.config.budget_seconds = 10_000_000
+        original = runner.process_post
+        count = {'n': 0}
+
+        def interrupted(path, from_listing=True):
+            count['n'] += 1
+            if count['n'] == 3:
+                runner.deadline = clock.now  # the time budget ends after two posts
+            return original(path, from_listing)
+
+        runner.process_post = interrupted
+        runner.cycle()
+        assert [c.rsplit('/', 1)[1] for c in site.calls] == ['4', '3', '2']
+        assert store.backlog == ['/@u1/works/1']  # what is left is the oldest post
+
+        second, store2, skeb2 = make(paths(6), posts, store=store)
+        second.process_post = original.__func__.__get__(second)
+        site.calls.clear()
+        second.cycle()
+        assert [c.rsplit('/', 1)[1] for c in site.calls][:2] == ['6', '5']  # newest arrivals come before the leftovers
+
+    def test_retries_wait_until_every_fresh_post_is_done(self, env):
+        site, clock, make = env
+        listing = paths(2)
+        posts = {listing[0]: 'https://fake.test/fresh0', listing[1]: 'https://fake.test/fresh1'}
+        runner, store, skeb = make(listing, posts)
+        store.add_pending({'rid': 'fake_old', 'url': 'https://fake.test/old', 'prefix': 'x_', 'post': '/@x/works/1',
+                           'site': 'fake', 'attempts': 1, 'first_seen': 0, 'last_error': '', 'next_try': 0})
+        runner.cycle()
+        assert site.calls == ['https://fake.test/fresh0', 'https://fake.test/fresh1', 'https://fake.test/old']
+
+    def test_retries_do_not_run_while_fresh_posts_are_still_waiting(self, env):
+        site, clock, make = env
+        listing = paths(3)
+        posts = {p: f'https://fake.test/f{p[-1]}' for p in listing}
+        runner, store, skeb = make(listing, posts)
+        store.add_pending({'rid': 'fake_old', 'url': 'https://fake.test/old', 'prefix': 'x_', 'post': '/@x/works/1',
+                           'site': 'fake', 'attempts': 1, 'first_seen': 0, 'last_error': '', 'next_try': 0})
+        runner.deadline = clock.now + 100  # not enough time left to finish: only two posts fit
+        original = runner.process_post
+
+        def one_post_then_out_of_time(path, from_listing=True):
+            result = original(path, from_listing)
+            runner.deadline = clock.now  # budget gone after the first post
+            return result
+
+        runner.process_post = one_post_then_out_of_time
+        runner.cycle()
+        assert 'https://fake.test/old' not in site.calls and store.backlog  # the old failure waited for the fresh ones
+
+    def test_linked_old_works_come_after_the_retry_queue(self, env):
+        site, clock, make = env
+        listing = ['/@a/works/10']
+        posts = {'/@a/works/10': 'https://skeb.jp/@b/works/3', '/@b/works/3': 'https://fake.test/linked'}
+        runner, store, skeb = make(listing, posts)
+        store.add_pending({'rid': 'fake_old', 'url': 'https://fake.test/old', 'prefix': 'x_', 'post': '/@x/works/1',
+                           'site': 'fake', 'attempts': 1, 'first_seen': 0, 'last_error': '', 'next_try': 0})
+        runner.cycle()
+        assert site.calls == ['https://fake.test/old', 'https://fake.test/linked']
+
+    def test_when_skeb_is_unavailable_the_retry_queue_still_goes_ahead(self, env):
+        site, clock, make = env
+        runner, store, skeb = make(paths(2), {})
+        store.add_pending({'rid': 'fake_old', 'url': 'https://fake.test/old', 'prefix': 'x_', 'post': '/@x/works/1',
+                           'site': 'fake', 'attempts': 1, 'first_seen': 0, 'last_error': '', 'next_try': 0})
+
+        def down(offset, limit):
+            skeb.request_count += 1
+            raise requests.ConnectionError('down')
+
+        skeb.get_page = down
+        runner.cycle()
+        assert site.calls == ['https://fake.test/old']
+
+
+@pytest.mark.unittest
+class TestLease:
+    def make_store(self, client=None):
+        store = MemStore()
+        if client is not None:
+            store.client = client
+        return store
+
+    def lease_of(self, store):
+        return store.read_lease()
+
+    def test_a_free_lease_is_taken_and_released(self):
+        store = self.make_store()
+        store.acquire_lease('run-1', sleep=lambda s: None)
+        assert self.lease_of(store)['holder'] == 'run-1'
+        store.release_lease('run-1')
+        assert self.lease_of(store)['holder'] is None
+
+    def test_a_live_holder_keeps_a_second_crawler_out(self):
+        from test.prepare.store import LeaseUnavailable
+        client = FakeClient()
+        first, second = self.make_store(client), self.make_store(client)
+        first.acquire_lease('run-1', sleep=lambda s: None)
+        waited = []
+        with pytest.raises(LeaseUnavailable):
+            second.acquire_lease('run-2', wait_limit=0.0, sleep=waited.append)
+        assert self.lease_of(first)['holder'] == 'run-1'
+
+    def test_a_dead_holder_is_replaced_after_the_ttl(self):
+        import json
+        from test.prepare import store as store_module
+        client = FakeClient()
+        client.files['state/lease.json'] = json.dumps({'holder': 'dead', 'at': time.time() - store_module.LEASE_TTL - 5}).encode()
+        store = self.make_store(client)
+        store.acquire_lease('run-2', sleep=lambda s: None)
+        assert self.lease_of(store)['holder'] == 'run-2'
+
+    def test_the_loser_of_a_simultaneous_write_waits(self):
+        client = FakeClient()
+        store = self.make_store(client)
+        import json
+
+        def rival_writes_during_the_settle_time(seconds):
+            if seconds < 5:  # the settle sleep, not the wait between attempts
+                client.files['state/lease.json'] = json.dumps({'holder': 'rival', 'at': time.time()}).encode()
+
+        from test.prepare.store import LeaseUnavailable
+        with pytest.raises(LeaseUnavailable):
+            store.acquire_lease('run-1', wait_limit=0.0, sleep=rival_writes_during_the_settle_time, settle=1.0)
+
+    def test_keeping_the_lease_fails_when_someone_else_took_it(self):
+        import json
+        client = FakeClient()
+        store = self.make_store(client)
+        store.acquire_lease('run-1', sleep=lambda s: None)
+        assert store.keep_lease('run-1') is True
+        client.files['state/lease.json'] = json.dumps({'holder': 'usurper', 'at': time.time()}).encode()
+        assert store.keep_lease('run-1') is False
+        store.release_lease('run-1')  # must not clear somebody else's lease
+        assert self.lease_of(store)['holder'] == 'usurper'
+
+    def test_a_run_stops_when_it_loses_the_lease(self, env):
+        import json
+        site, clock, make = env
+        runner, store, skeb = make(paths(3), {p: 'https://fake.test/x' + p[-1] for p in paths(3)})
+        runner.use_lease = True
+        runner.config.lease_every = 0.0
+        runner.sleep = lambda s: None
+        store.acquire_lease = lambda holder, **kw: None
+        original_keep = store.keep_lease
+        store.keep_lease = lambda holder: False  # somebody else took over
+        runner.run()
+        assert runner.stop_reason == 'lease lost' and site.calls == []
