@@ -4,8 +4,9 @@ name: Newest
 on:
   #  push:
   workflow_dispatch:
-  schedule:
-    - cron: '*/15 * * * *'
+  # schedule paused while the pipeline is being reworked; runs are triggered manually
+  #  schedule:
+  #    - cron: '*/15 * * * *'
 
 jobs:
   unittest:
