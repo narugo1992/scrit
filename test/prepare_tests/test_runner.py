@@ -320,3 +320,65 @@ class TestFailureListIsCommittedWithEveryUpload:
         store.last_commit_at = time.time() - 1000
         runner.process_post(listing[0])
         assert any('state/newest.json' in c['paths'] for c in store.client.commits)
+
+
+@pytest.mark.unittest
+class TestSkebHiccups:
+    def test_listing_network_error_does_not_crash_the_run(self, env):
+        site, clock, make = env
+        runner, store, skeb = make(paths(2), {})
+
+        def broken(offset, limit):
+            skeb.request_count += 1
+            raise requests.ConnectionError('Remote end closed connection')
+
+        skeb.get_page = broken
+        runner.cycle()  # must not raise
+        assert runner.stop_reason == 'skeb unavailable'
+
+    def test_listing_5xx_waits_for_the_next_poll(self, env):
+        site, clock, make = env
+        runner, store, skeb = make(paths(2), {})
+
+        def broken(offset, limit):
+            response = requests.Response()
+            response.status_code = 502
+            raise requests.HTTPError('502', response=response)
+
+        skeb.get_page = broken
+        runner.cycle()
+        assert runner.stop_reason == 'skeb unavailable'
+
+    def test_client_retries_a_dropped_connection_once(self, monkeypatch):
+        from pyskeb.client.client import SkebClient
+        client = SkebClient()
+        calls = []
+
+        class Resp:
+            status_code = 200
+            cookies = {}
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {'ok': True}
+
+        def flaky_get(url, params=None):
+            calls.append(url)
+            if len(calls) == 1:
+                raise requests.ConnectionError('closed')
+            return Resp()
+
+        monkeypatch.setattr(client._session, 'get', flaky_get)
+        monkeypatch.setattr('pyskeb.client.client.time.sleep', lambda s: None)
+        assert client._get('/api/works') == {'ok': True}
+        assert len(calls) == 2
+
+    def test_client_gives_up_after_the_second_failure(self, monkeypatch):
+        from pyskeb.client.client import SkebClient
+        client = SkebClient()
+        monkeypatch.setattr(client._session, 'get', lambda url, params=None: (_ for _ in ()).throw(requests.ConnectionError('x')))
+        monkeypatch.setattr('pyskeb.client.client.time.sleep', lambda s: None)
+        with pytest.raises(requests.ConnectionError):
+            client._get('/api/works')

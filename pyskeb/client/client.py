@@ -39,11 +39,20 @@ class SkebClient:
             time.sleep(wait)
         self._last_request = time.time()
 
+    def _send(self, url, params):
+        try:
+            return self._session.get(url, params=params)
+        except (requests.ConnectionError, requests.Timeout):
+            # the server drops idle keep-alive connections; one retry on a fresh connection is not extra load
+            self._session.close()
+            time.sleep(5.0)
+            return self._session.get(url, params=params)
+
     def _get(self, url, params=None):
         for attempt in range(3):
             self._pace()
             self.request_count += 1
-            resp = self._session.get(urljoin(SKEB_WEBISTE, url), params=params or {})
+            resp = self._send(urljoin(SKEB_WEBISTE, url), params or {})
             if resp.status_code != 429:
                 resp.raise_for_status()
                 return resp.json()

@@ -262,6 +262,16 @@ class Runner:
             self._handle_jobs([job], f'newest: retry {rid} (attempt {job.attempts + 1})')
 
     # ---------------------------------------------------------------- listing
+    def _page(self, offset: int) -> List[Dict]:
+        try:
+            return self.skeb.get_page(offset, LIST_PAGE_SIZE)
+        except (requests.ConnectionError, requests.Timeout) as err:
+            raise SkebUnavailable(f'listing at offset {offset}: {err!r}') from err
+        except requests.HTTPError as err:
+            if isinstance(err, SkebRateLimitError) or err.response is None or err.response.status_code < 500:
+                raise
+            raise SkebUnavailable(f'listing at offset {offset}: {err!r}') from err
+
     def collect_new_posts(self) -> List[str]:
         """Paths of posts newer than the cursor, newest first."""
         head = set(self.store.head)
@@ -270,7 +280,7 @@ class Runner:
         known_streak = 0
         offset = 0
         while offset < LIST_MAX_OFFSET and self._skeb_budget_left():
-            items = self.skeb.get_page(offset, LIST_PAGE_SIZE)
+            items = self._page(offset)
             if not items:
                 break
             for item in items:
