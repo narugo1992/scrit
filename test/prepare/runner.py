@@ -11,6 +11,7 @@ import requests
 from hbutils.system import TemporaryDirectory
 
 from pyskeb.client.client import SkebRateLimitError
+from .fmt import pretty_size, plural, by_site
 from .errors import GenericException, NoContent, ResourceBlocked, ResourceGone, ResourceTransient
 from .http import Fetcher
 from .process import build_zip
@@ -74,6 +75,7 @@ class Runner:
         self.use_lease = use_lease
         self._last_poll = 0.0
         self._last_lease = 0.0
+        self._checked = 0
         self.skeb = skeb
         self.fx = fx
         self.config = config
@@ -155,10 +157,26 @@ class Runner:
             'next_try': self.clock() + delay,
         })
 
-    def _handle_jobs(self, jobs: List[Job], message: str):
-        """Run the jobs of one post (or one retry batch) and commit everything in a single commit."""
+    def _title(self, kind: str, label: str, jobs: List[Job], zips: Dict[str, str], gone: int, queued: int) -> str:
+        """``[new] @user/works/12 | +2 res, 48.3 MiB (googledrive 1, imgur 1) | 37 posts waiting``"""
+        uploaded = [job for job in jobs if job.rid in zips]
+        if uploaded:
+            total = sum(os.path.getsize(path) for path in zips.values())
+            got = f'+{len(uploaded)} res, {pretty_size(total)} ({by_site(job.site.NAME for job in uploaded)})'
+        else:
+            got = '+0 res'
+        notes = [text for text in (f'{gone} gone or empty' if gone else '', f'{queued} queued for retry' if queued else '')
+                 if text]
+        title = f'[{kind}] {label} | {got}' + (', ' + ', '.join(notes) if notes else '')
+        if kind != 'retry':
+            title += f' | {plural(len(self.store.backlog), "post")} waiting'
+        return title
+
+    def _handle_jobs(self, jobs: List[Job], kind: str, label: str):
+        """Run the jobs of one post (or one retry) and commit everything in a single commit."""
         zips: Dict[str, str] = {}
         done_jobs: List[Job] = []
+        gone = queued = 0
         with TemporaryDirectory() as td:
             for job in jobs:
                 status, zip_path = self._attempt(job, td)
@@ -168,13 +186,17 @@ class Runner:
                     done_jobs.append(job)
                 elif status in ('retry', 'bug', 'deferred'):
                     self._queue(job, status)
+                    queued += 1
                 else:
                     self.store.drop_pending(job.rid)
                     self.store.done.add(job.rid)
                     if status in ('gone', 'empty'):
                         self.store.note_dropped(job.rid, status, job.last_error, job.post)
+                        gone += 1
+            message = self._title(kind, label, jobs, zips, gone, queued)
+            description = '\n'.join(f'{rid}  {pretty_size(os.path.getsize(path))}' for rid, path in zips.items())
             try:
-                self.store.commit(zips, message)
+                self.store.commit(zips, message, description)
             except CommitFailed as err:
                 logging.error(str(err))
                 for job in done_jobs:
@@ -182,7 +204,7 @@ class Runner:
                     self._count(job.site.NAME, 'commit_failed')
                     self._queue(job, 'retry')
                 try:
-                    self.store.commit({}, message + ' (queue after failed commit)')
+                    self.store.commit({}, f'[{kind}] {label} | upload failed, {len(done_jobs)} queued for retry')
                 except CommitFailed as state_err:
                     logging.error(f'state could not be saved either: {state_err}')
                 return
@@ -190,6 +212,7 @@ class Runner:
                 self.store.drop_pending(job.rid)
                 self.store.done.add(job.rid)
                 logging.info(f'{job.rid}: uploaded')
+        self._checked = 0
         self._posts_since_flush = 0
 
     # ---------------------------------------------------------------- one post
@@ -231,13 +254,15 @@ class Runner:
 
         if from_listing:
             self.store.mark_done(path)
+        label = path.lstrip('/') if from_listing else f'{path.lstrip("/")} (linked from a post)'
         if jobs:
-            self._handle_jobs(jobs, f'newest: {path} +{len(jobs)} resource(s)')
+            self._handle_jobs(jobs, 'new' if from_listing else 'old', label)
         else:
+            self._checked += 1
             self._posts_since_flush += 1
             idle = time.time() - self.store.last_commit_at
             if self._posts_since_flush >= self.config.flush_every or idle >= self.config.flush_seconds:
-                self.store.commit({}, 'newest: update state')
+                self._flush()
                 self._posts_since_flush = 0
 
     # ---------------------------------------------------------------- linked works
@@ -274,7 +299,7 @@ class Runner:
             site, rid = resolved
             job = Job(url=item['url'], prefix=item['prefix'], rid=rid, site=site, post=item['post'],
                       attempts=item['attempts'], first_seen=item['first_seen'], last_error=item['last_error'])
-            self._handle_jobs([job], f'newest: retry {rid} (attempt {job.attempts + 1})')
+            self._handle_jobs([job], 'retry', f'{rid} (attempt {job.attempts + 1}, from {job.post.lstrip("/")})')
 
     # ---------------------------------------------------------------- listing
     def _page(self, offset: int) -> List[Dict]:
@@ -334,6 +359,15 @@ class Runner:
             logging.info(f'{len(fresh)} new post(s) queued in front of {len(self.store.backlog)} waiting.')
             self.store.enqueue(fresh)
 
+    def _flush(self):
+        """Commit the bookkeeping on its own, saying what happened since the last commit."""
+        if not self.store.dirty:
+            return
+        checked, self._checked = self._checked, 0
+        waiting = plural(len(self.store.backlog), 'post')
+        what = f'{plural(checked, "post")} checked, nothing to fetch' if checked else 'queue and cursor updated'
+        self.store.commit({}, f'[state] {what} | {waiting} waiting')
+
     def _keep_lease(self, force: bool = False):
         if not self.use_lease or (not force and self.clock() - self._last_lease < self.config.lease_every):
             return
@@ -382,7 +416,7 @@ class Runner:
         fresh_waiting = skeb_ok and not failed and bool(self.store.backlog)
         if not pending_done and not fresh_waiting:
             self.process_pending()  # nothing fresh can be fetched right now, the old failures may go ahead
-        self.store.commit({}, 'newest: update state')
+        self._flush()
         return processed
 
     def run(self):
@@ -400,7 +434,7 @@ class Runner:
                     break
                 self.stop_reason = ''
                 self.sleep(self.config.poll_interval)
-            self.store.commit({}, 'newest: update state')
+            self._flush()
         except LeaseLost as err:
             logging.error(str(err))
             self.stop_reason = 'lease lost'

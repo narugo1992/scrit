@@ -17,7 +17,7 @@ class FakeClient:
         self.commits = []
         self.failures = failures
 
-    def create_commit(self, repo_id, repo_type, operations, commit_message):
+    def create_commit(self, repo_id, repo_type, operations, commit_message, commit_description=''):
         if self.failures:
             self.failures -= 1
             raise HfHubHTTPError('boom')
@@ -69,3 +69,11 @@ class TestPromotion:
         fake.failures = repack.COMMIT_ATTEMPTS
         with pytest.raises(HfHubHTTPError):
             repack.promote_oversized()
+
+
+@pytest.mark.unittest
+def test_pack_commit_titles_say_what_went_in_and_how_big(fake, monkeypatch):
+    listing(monkeypatch, {'big_one': 9 * GB})
+    assert repack.promote_oversized() is True
+    message = fake.commits[0][0]
+    assert message.startswith('[pack] pack_') and '1 oversized res, 9.0 GiB, copied as is | big_one' in message

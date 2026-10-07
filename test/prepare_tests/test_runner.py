@@ -18,12 +18,13 @@ class FakeClient:
         self.fail_commits = 0
         self.files: Dict[str, bytes] = {}
 
-    def create_commit(self, repo_id, repo_type, operations, commit_message):
+    def create_commit(self, repo_id, repo_type, operations, commit_message, commit_description=''):
         if self.fail_commits:
             self.fail_commits -= 1
             raise requests.ConnectionError('boom')
         self.commits.append({
             'message': commit_message,
+            'description': commit_description,
             'paths': [op.path_in_repo for op in operations],
         })
         for op in operations:

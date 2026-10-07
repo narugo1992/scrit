@@ -178,11 +178,12 @@ class Store:
         return self._dirty_state or self._dirty_pending
 
     # ------------------------------------------------------------ writing
-    def _create_commit(self, operations, message: str):
+    def _create_commit(self, operations, message: str, description: str = ''):
+        extra = {'commit_description': description} if description else {}
         for attempt in range(1, COMMIT_ATTEMPTS + 1):
             try:
                 self.client.create_commit(repo_id=self.repo_id, repo_type='dataset', operations=operations,
-                                          commit_message=message)
+                                          commit_message=message, **extra)
             except (HfHubHTTPError, requests.ConnectionError, requests.Timeout) as err:
                 if attempt == COMMIT_ATTEMPTS:
                     raise CommitFailed(f'commit {message!r} failed {attempt} times: {err!r}') from err
@@ -192,7 +193,7 @@ class Store:
             else:
                 return
 
-    def commit(self, zips: Optional[Dict[str, str]] = None, message: str = 'newest: update state'):
+    def commit(self, zips: Optional[Dict[str, str]] = None, message: str = '[state] update', description: str = ''):
         """One atomic commit with the new zips and the state files that changed."""
         zips = zips or {}
         if not zips and not self.dirty:
@@ -210,7 +211,7 @@ class Store:
                 path_or_fileobj=json.dumps({'version': 1, 'items': self.pending}, ensure_ascii=False,
                                            indent=1).encode('utf-8')))
 
-        self._create_commit(operations, message)
+        self._create_commit(operations, message, description)
 
         self.unarchived.update(zips)
         self._dirty_state = self._dirty_pending = False
@@ -227,7 +228,7 @@ class Store:
         body = {'holder': holder, 'at': time.time(), 'run': os.environ.get('GITHUB_RUN_ID', '')}
         self._create_commit(
             [CommitOperationAdd(path_in_repo=LEASE_PATH, path_or_fileobj=json.dumps(body).encode('utf-8'))],
-            'newest: lease' if holder else 'newest: release the lease')
+            f'[lease] held by run {body["run"] or "local"}' if holder else '[lease] released')
 
     def _held_by_other(self, lease: Dict, holder: str) -> bool:
         return bool(lease.get('holder')) and lease['holder'] != holder and time.time() - lease.get('at', 0) <= LEASE_TTL

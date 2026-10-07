@@ -19,6 +19,7 @@ from tqdm.auto import tqdm
 from hfutils.operate import hf_repo_glob, download_file_to_file
 from pyskeb.utils.download import download_file
 from .base import _REPOSITORY, hf_client, _ensure_repository
+from .fmt import pretty_size
 
 hf_token = os.environ.get('HF_TOKEN')
 
@@ -151,7 +152,7 @@ def _load_archived_ids():
             return json.load(f)
 
 
-def _publish_pack(package_name, package_size, pack_operation, fns, archived_resource_ids) -> bool:
+def _publish_pack(package_name, package_size, pack_operation, fns, archived_resource_ids, message=None) -> bool:
     """Register a new pack: delete its sources from ``unarchived/`` and refresh README, index and archived ids.
 
     Everything goes into one commit. ``pack_operation`` adds the pack file, either by uploading a zip that was
@@ -218,7 +219,7 @@ def _publish_pack(package_name, package_size, pack_operation, fns, archived_reso
                     repo_id=_REPOSITORY,
                     repo_type='dataset',
                     operations=operations,
-                    commit_message=f'Create new package {package_name!r}.'
+                    commit_message=message or f'Create new package {package_name!r}.'
                 )
             except HfHubHTTPError as err:
                 if attempt == COMMIT_ATTEMPTS:
@@ -254,6 +255,7 @@ def promote_oversized() -> bool:
         package_name, item.size,
         CommitOperationCopy(src_path_in_repo=f'unarchived/{filename}', path_in_repo=f'packs/{package_name}'),
         [filename], _load_archived_ids(),
+        message=f'[pack] {package_name} | 1 oversized res, {pretty_size(item.size)}, copied as is | {os.path.splitext(filename)[0]}',
     )
 
 
@@ -271,8 +273,10 @@ def repack_all() -> bool:
 
         package_name = f'pack_{_timestamp()}.zip'
         logging.info(f'Creating new pack {package_name!r} ...')
+        size = os.path.getsize(zip_file)
         return _publish_pack(
-            package_name, os.path.getsize(zip_file),
+            package_name, size,
             CommitOperationAdd(path_or_fileobj=zip_file, path_in_repo=f'packs/{package_name}'),
             fns, archived_resource_ids,
+            message=f'[pack] {package_name} | {len(fns)} res merged, {pretty_size(size)}',
         )
