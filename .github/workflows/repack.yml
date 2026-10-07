@@ -5,7 +5,13 @@ on:
   #  push:
   workflow_dispatch:
   schedule:
-    - cron: '30 12 * * *'
+    # every 6 hours, up to 6 packs each: newest can now bring in tens of GB per day
+    - cron: '41 */6 * * *'
+
+# two repackers would pack the same files twice
+concurrency:
+  group: repack
+  cancel-in-progress: false
 
 jobs:
   unittest:
@@ -73,4 +79,4 @@ jobs:
           REMOTE_REPOSITORY: ${{ secrets.REMOTE_REPOSITORY }}
         shell: bash
         run: |
-          python -m test.prepare pack
+          python -m test.prepare pack --rounds 6

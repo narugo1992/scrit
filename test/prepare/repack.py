@@ -123,8 +123,10 @@ def _timestamp():
     return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 
 
-def repack_all():
+def repack_all() -> bool:
+    """Create at most one pack from ``unarchived/``; returns whether a pack was created."""
     _ensure_repository()
+    created = False
     # Use HfApi.file_exists instead of hf_fs.exists
     if hf_client.file_exists(
         repo_id=_REPOSITORY,
@@ -149,7 +151,7 @@ def repack_all():
     with repack_zips(max_size_limit=5.5 * 1024 ** 3) as (zip_file, fns):
         if zip_file is None:
             logging.info('No files to repack, skipped.')
-            return
+            return False
 
         package_name = f'pack_{_timestamp()}.zip'
         logging.info(f'Creating new pack {package_name!r} ...')
@@ -225,4 +227,7 @@ def repack_all():
                         logging.exception(err)
                         logging.warning('Retry to commit ...')
                     else:
+                        created = True
                         break
+
+    return created
