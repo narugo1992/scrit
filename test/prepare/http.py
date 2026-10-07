@@ -11,6 +11,9 @@ from urllib.parse import urlsplit, urljoin
 
 import pyrfc6266
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.connection import HTTPConnection, HTTPSConnection
+from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
 
 from .errors import ResourceTransient, UnexpectedResponse, UnsafeUrl, TooLarge
 
@@ -25,6 +28,45 @@ _HOST_TTL = 600.0
 # one resource may not use more disk than this; a runner has about 14 GB free
 MAX_RESOURCE_BYTES = 6 * 1024 ** 3
 _CHUNK_SIZE = 1 << 20
+
+
+def _peer_is_public(sock) -> bool:
+    return ipaddress.ip_address(sock.getpeername()[0]).is_global
+
+
+class _GuardedHTTPConnection(HTTPConnection):
+    """Checks the address the socket really connected to, which closes the DNS rebinding window left open
+    by resolving a host once for validation and again for the actual connection."""
+
+    def _new_conn(self):
+        sock = super()._new_conn()
+        if not _peer_is_public(sock):
+            sock.close()
+            raise UnsafeUrl(f'{self.host!r} connected to a non-public address')
+        return sock
+
+
+class _GuardedHTTPSConnection(HTTPSConnection):
+    def _new_conn(self):
+        sock = super()._new_conn()
+        if not _peer_is_public(sock):
+            sock.close()
+            raise UnsafeUrl(f'{self.host!r} connected to a non-public address')
+        return sock
+
+
+class _GuardedHTTPPool(HTTPConnectionPool):
+    ConnectionCls = _GuardedHTTPConnection
+
+
+class _GuardedHTTPSPool(HTTPSConnectionPool):
+    ConnectionCls = _GuardedHTTPSConnection
+
+
+class PublicOnlyAdapter(HTTPAdapter):
+    def init_poolmanager(self, *args, **kwargs):
+        super().init_poolmanager(*args, **kwargs)
+        self.poolmanager.pool_classes_by_scheme = {'http': _GuardedHTTPPool, 'https': _GuardedHTTPSPool}
 
 
 @dataclass
@@ -67,9 +109,17 @@ class Fetcher:
     """HTTP helper shared by the site handlers: fixed modern UA, per-host pacing, bounded retries."""
 
     def __init__(self, gap: float = 1.0, gaps: Optional[Dict[str, float]] = None,
-                 timeout=(15, 90), retries: int = 3, user_agent: str = MODERN_UA):
+                 timeout=(15, 90), retries: int = 3, user_agent: str = MODERN_UA,
+                 public_peers_only: Optional[bool] = None):
         self.session = requests.Session()
         self.session.headers['User-Agent'] = user_agent
+        if public_peers_only is None:
+            # a developer machine behind a local proxy needs SCRIT_ALLOW_PRIVATE_PEERS=1; CI never does
+            public_peers_only = os.environ.get('SCRIT_ALLOW_PRIVATE_PEERS') != '1'
+        if public_peers_only:
+            adapter = PublicOnlyAdapter()
+            self.session.mount('http://', adapter)
+            self.session.mount('https://', adapter)
         self.gap = gap
         self.gaps = dict(gaps or {})
         self.timeout = timeout

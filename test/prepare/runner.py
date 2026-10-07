@@ -14,6 +14,7 @@ from .errors import GenericException, NoContent, ResourceBlocked, ResourceGone, 
 from .http import Fetcher
 from .process import build_zip
 from .sites import resolve
+from .sites.common import host_of
 from .store import CommitFailed, Store
 from .url import extract_urls
 
@@ -53,6 +54,7 @@ class RunConfig:
     max_skeb_requests: int = 4500
     flush_every: int = 20
     retry_batch: int = 20
+    max_extra_posts: int = 100
     once: bool = False
 
 
@@ -68,6 +70,7 @@ class Runner:
         self.cooldown: Dict[str, float] = {}
         self.deadline = clock() + config.budget_seconds
         self.counters: Dict[str, int] = {}
+        self.discovered: List[str] = []
         self.bugs = 0
         self.stop_reason = ''
         self._posts_since_flush = 0
@@ -145,7 +148,7 @@ class Runner:
         with TemporaryDirectory() as td:
             for job in jobs:
                 status, zip_path = self._attempt(job, td)
-                self._count(job.site.NAME, status)
+                self._count(job.site.NAME, 'uploaded' if status == 'ok' else status)
                 if status == 'ok':
                     zips[job.rid] = zip_path
                     done_jobs.append(job)
@@ -174,7 +177,7 @@ class Runner:
         self._posts_since_flush = 0
 
     # ---------------------------------------------------------------- one post
-    def process_post(self, path: str):
+    def process_post(self, path: str, from_listing: bool = True):
         username, work_id = split_post_path(path)
         try:
             post = self.skeb.get_post(username, work_id)
@@ -186,16 +189,21 @@ class Runner:
             if err.response is not None and err.response.status_code >= 500:
                 raise SkebUnavailable(f'{path}: {err!r}') from err
             logging.warning(f'{path}: cannot read the post ({err}), skipped')
-            self.store.push_head(path)
+            if from_listing:
+                self.store.push_head(path)
             return
 
         text = f"{post.get('source_body') or ''}\n{post.get('body') or ''}"
         jobs: List[Job] = []
         seen = set()
         for url in extract_urls(text):
+            if from_listing and self._is_skeb_work(url):
+                self._discover(url)
+                continue
             resolved = resolve(url)
             if resolved is None:
                 self.store.bump('unsupported', 'urls')
+                self.store.note_unsupported(host_of(url))
                 continue
             site, rid = resolved
             if rid in seen:
@@ -205,7 +213,8 @@ class Runner:
                             first_seen=self.clock()))
         logging.info(f'{path}: {len(jobs)} supported resource(s)')
 
-        self.store.push_head(path)
+        if from_listing:
+            self.store.push_head(path)
         if jobs:
             self._handle_jobs(jobs, f'newest: {path} +{len(jobs)} resource(s)')
         else:
@@ -213,6 +222,26 @@ class Runner:
             if self._posts_since_flush >= self.config.flush_every:
                 self.store.commit({}, 'newest: update state')
                 self._posts_since_flush = 0
+
+    # ---------------------------------------------------------------- linked works
+    @staticmethod
+    def _is_skeb_work(url: str) -> bool:
+        return host_of(url) == 'skeb.jp' and re.fullmatch(r'/@[^/]+/works/\d+/?', re.sub(r'[?#].*$', '', url.split('skeb.jp', 1)[-1])) is not None
+
+    def _discover(self, url: str):
+        """A post that links another work usually quotes an earlier commission with its own references."""
+        path = re.sub(r'[?#].*$', '', url.split('skeb.jp', 1)[-1]).rstrip('/')
+        if path not in self.store.head and path not in self.discovered:
+            self.discovered.append(path)
+
+    def process_discovered(self):
+        todo, self.discovered = self.discovered, []
+        for path in todo[:self.config.max_extra_posts]:
+            if self._time_left() < 180 or not self._skeb_budget_left():
+                break
+            if self.store.remember_extra(path):
+                self.process_post(path, from_listing=False)
+                self._count('skeb', 'linked_work')
 
     # ---------------------------------------------------------------- queue
     def process_pending(self):
@@ -283,6 +312,7 @@ class Runner:
                         break
                     self.process_post(path)
                     processed += 1
+                self.process_discovered()
                 if self.store.state['skeb'].get('ban_streak'):
                     self.store.set_skeb(ban_streak=0)
             except SkebRateLimitError:

@@ -257,3 +257,36 @@ class TestRunner:
         assert runner.bugs == 1
         assert store.head == listing
         assert store.pending[0]['attempts'] == 1
+
+
+@pytest.mark.unittest
+class TestDiscovery:
+    def test_linked_work_is_processed_without_touching_the_cursor(self, env):
+        site, clock, make = env
+        listing = ['/@a/works/10']
+        posts = {
+            '/@a/works/10': 'see https://skeb.jp/@b/works/3?foo=1 and https://fake.test/main',
+            '/@b/works/3': 'older request https://fake.test/old and https://skeb.jp/@c/works/9',
+        }
+        runner, store, skeb = make(listing, posts)
+        runner.cycle()
+        assert sorted(site.calls) == ['https://fake.test/main', 'https://fake.test/old']
+        assert store.head == ['/@a/works/10']  # the linked work never enters the cursor
+        assert store.state['extra_seen'] == ['/@b/works/3']  # and its own skeb links are not chased
+
+    def test_linked_work_is_handled_once(self, env):
+        site, clock, make = env
+        listing = ['/@a/works/10']
+        posts = {'/@a/works/10': 'https://skeb.jp/@b/works/3', '/@b/works/3': 'https://fake.test/old'}
+        runner, store, skeb = make(listing, posts)
+        runner.cycle()
+        store.state['head'] = []  # simulate a second sweep over the same listing
+        runner.cycle()
+        assert site.calls == ['https://fake.test/old']
+
+    def test_unsupported_hosts_are_counted(self, env):
+        site, clock, make = env
+        listing = ['/@a/works/10']
+        runner, store, skeb = make(listing, {'/@a/works/10': 'https://www.example.org/x https://example.org/y'})
+        runner.cycle()
+        assert store.state['unsupported_hosts'] == {'example.org': 2}

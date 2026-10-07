@@ -99,6 +99,25 @@ class Store:
             bucket[status] = bucket.get(status, 0) + amount
         self._dirty_state = True
 
+    def note_unsupported(self, host: str):
+        """Count links to hosts without a handler, to see which site is worth adding next."""
+        hosts = self.state.setdefault('unsupported_hosts', {})
+        hosts[host] = hosts.get(host, 0) + 1
+        if len(hosts) > 400:
+            for name, _ in sorted(hosts.items(), key=lambda item: item[1])[:100]:
+                del hosts[name]
+        self._dirty_state = True
+
+    def remember_extra(self, path: str, limit: int = 4000) -> bool:
+        """Remember a work found through a link; returns False when it was already handled."""
+        seen = self.state.setdefault('extra_seen', [])
+        if path in seen:
+            return False
+        seen.append(path)
+        del seen[:-limit]
+        self._dirty_state = True
+        return True
+
     def set_skeb(self, **values):
         self.state['skeb'].update(values)
         self._dirty_state = True

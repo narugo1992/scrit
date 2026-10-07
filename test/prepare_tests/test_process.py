@@ -177,3 +177,39 @@ def _make_zip(out_dir, count):
         for index in range(count):
             zf.writestr(f'f{index}.txt', 'x')
     return path
+
+
+@pytest.mark.unittest
+class TestConnectionGuard:
+    def test_loopback_server_is_refused_even_if_the_name_check_is_bypassed(self, monkeypatch):
+        import threading
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+        from test.prepare.errors import UnsafeUrl
+        from test.prepare.http import Fetcher
+
+        served = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                served.append(self.path)
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'secret')
+
+            def log_message(self, *args):
+                pass
+
+        server = HTTPServer(('127.0.0.1', 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            fx = Fetcher(gap=0, public_peers_only=True)
+            monkeypatch.setattr(fx, 'check_public', lambda url: None)  # simulate a rebinding host name
+            with pytest.raises(UnsafeUrl):
+                fx.get(f'http://127.0.0.1:{server.server_address[1]}/meta')
+            assert served == []
+
+            open_fx = Fetcher(gap=0, public_peers_only=False)
+            monkeypatch.setattr(open_fx, 'check_public', lambda url: None)
+            assert open_fx.get(f'http://127.0.0.1:{server.server_address[1]}/ok').text == 'secret'
+        finally:
+            server.shutdown()
