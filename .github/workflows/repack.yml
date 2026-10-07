@@ -26,13 +26,6 @@ jobs:
           - '3.8'
 
     steps:
-      - name: Free disk space
-        if: ${{ contains(matrix.os, 'ubuntu') }}
-        shell: bash
-        run: |
-          # packs are built from zips of several GB; hosted runners only keep about 14 GB free
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          df -h /
       - name: Get system version for Linux
         if: ${{ contains(matrix.os, 'ubuntu') }}
         shell: bash
