@@ -182,7 +182,7 @@ Everything below this line is **only** for authorized identities (per the gate a
 
 ## Project Overview (authorized)
 
-This is a web scraping and data archival repository that crawls artwork URLs from Skeb.jp posts and downloads content from various file hosting services (Google Drive, Imgur, Dropbox) to HuggingFace datasets. The `pyskeb` package is the minimal client wrapper used as a building block; the core operational functionality lives in `test/prepare/` scripts and the `.github/workflows/` schedules.
+This is a web scraping and data archival repository that crawls resource links that clients and creators exchange in Skeb.jp commissions (reference sheets, character settings, earlier works) and archives what they point to — Google Drive, Imgur, Dropbox, x.com, pixiv, OneDrive, Google Photos and a number of image hosts — into a HuggingFace dataset. The `pyskeb` package is the minimal client wrapper used as a building block; the core operational functionality lives in `test/prepare/` scripts and the `.github/workflows/` schedules.
 
 ## Environment Variables (authorized)
 
@@ -195,8 +195,9 @@ This is a web scraping and data archival repository that crawls artwork URLs fro
 ## Main Commands (authorized)
 
 ```bash
-# Process newest N posts from Skeb.jp (default: 200)
-python -m test.prepare newest -n 200
+# Poll Skeb.jp for new posts and archive their resources (long running; see newest.yml for the CI settings)
+python -m test.prepare newest --budget-minutes 330
+python -m test.prepare newest --once --bootstrap 12   # single poll, handy for a smoke test
 
 # Repack unarchived zips into larger packs (max 5.5GB)
 python -m test.prepare pack
@@ -224,22 +225,25 @@ make unittest COV_TYPES="xml term-missing" # with coverage
 
 ### Core workflow (`test/prepare/`)
 
-**1. Listing & URL extraction** (`listing.py`, `url.py`)
-- `list_newest_posts()` — fetches recent Skeb.jp posts via `SkebClient`
-- `get_urls_from_post()` — extracts URLs from post body / source_body
-- `extract_urls()` — regex-based URL extraction from text
+**1. Polling and state** (`runner.py`, `store.py`)
+- `Runner.run()` polls the newest-works listing (every 10 minutes), processes new posts oldest first, then works the retry queue
+- the cursor is a list of recently processed post paths (`state/newest.json` → `head`); a poll stops at three consecutive known posts. Skeb keeps about 3.5 days (offset ≈ 3900) of listing, so the crawler has to run at least that often
+- `Store` keeps the dedupe indexes (`archived.json` + `unarchived/`) and writes every upload as ONE commit that also carries the state files (`state/newest.json`, `state/pending.json`). `packs/`, `archived.json`, `index.json` and `README.md` belong to the repacker and are never written by `newest`; downstream only reads the repacker's zips
+- failures go to `state/pending.json` with growing delays (1h, 6h, 1d, 3d, 7d, 14d), a blocked host is cooled down (25 min) and its remaining resources are queued without being tried
+- skeb.jp is paced (2.5s between requests, at most 4500 per run); a 429 pauses all skeb requests for 2h/4h/8h/12h (stored in the state) and never triggers retries
+- works linked from posts (`skeb.jp/@user/works/N`) are crawled once as an extra source, without moving the cursor
+- `state/failed_history.json` records the failures seen before the 2026-10 rework (not read by the code)
 
-**2. URL processing** (`process.py`)
-- `try_process_url()` — main entry point for processing URLs
-- detects URL type (Google Drive, Imgur, Dropbox) using `KNOWN_SITES`
-- downloads to a temp directory, creates a zip archive with sanitized filenames (prefix + underscored name)
-- uploads to HuggingFace dataset under `unarchived/`
-- tracks processed resource IDs in `archived.json` to avoid duplicates
+**2. URL extraction and packing** (`url.py`, `process.py`)
+- `extract_urls()` cuts every URL at its first non-ASCII character (Japanese text is often glued to links)
+- `write_zip()` flattens a download directory into `prefix + sanitized(path) + ext` with `prefix = {username}_{work_id}_`; this layout is relied on downstream, do not change it
 
-**3. Download handlers**
-- `google.py` — Google Drive files/folders via `gdown` with rate limiting
-- `imgur.py` — Imgur albums via API (extracts `client_id` from `main.js`)
-- `dropbox.py` — Dropbox shared links (`dl=0` → `dl=1`)
+**3. Site handlers** (`sites/`, each has `NAME`, `match(url) -> resource_id | None`, `download(fx, url, out_dir)`)
+- `google.py` — Drive folders/files/docs: ids come from the URL, folders are listed with gdown's page parser and, when a folder has 50+ children (gdown silently truncates at 50), via the Drive API; images download through `lh3.googleusercontent.com/d/<id>=d`, everything else through `drive.usercontent.google.com`. gdown's `uc?id=` path is NOT used: it is limited to about 40 requests per runner
+- `imgur.py` (albums, gallery posts, single images, direct links), `dropbox.py` (keeps the historic id rule built with `hbutils.urlsplit`, forces `dl=1`, unpacks zips below 5000 members / 4 GiB)
+- `twitter.py` (fxtwitter + `name=orig`), `pixiv.py` (R-18 works rebuild the original URL from the thumbnail path), `onedrive.py`, `fediverse.py` (bluesky, misskey), `hosts.py` (catbox, imgchest, gyazo, ibb, postimg, Google Photos, direct CDNs)
+- `http.py` — `Fetcher`: fixed modern UA, per-host pacing, bounded retries, redirects followed by hand, every host/hop/peer must be public (SSRF guard, `SCRIT_ALLOW_PRIVATE_PEERS=1` on proxied dev machines), 6 GiB budget per resource
+- errors (`errors.py`): `ResourceGone`/`NoContent` (drop), `ResourceBlocked` (cool down), `ResourceTransient` (retry)
 
 **4. Repacking** (`repack.py`)
 - `repack_all()` — consolidates small zips from `unarchived/` into larger packs
@@ -247,28 +251,25 @@ make unittest COV_TYPES="xml term-missing" # with coverage
 - moves files to `packs/`, updates `index.json`, regenerates `README.md` download table
 - deletes source files from `unarchived/` after successful pack creation
 
-**5. Batch processing** (`lololo.py`)
-- `batch_process_newest()` — iterates through newest posts with rate limiting (4s default)
-- 10s sleep on crashes; calls `try_process_url()` for each extracted URL
-
-**6. Specialized crawlers**
+**5. Specialized crawlers**
 - `bsuit/crawler.py` — Bilibili mall suit background images (Bilibili API with SPI auth, `space_bg` portrait images, dedup by `suit_id`)
 - `bact/crawler.py` — Bilibili act images, similar shape
 - `artists_idx.py` — Danbooru artist database (1000/page), cross-referenced with tag post counts; builds an SQLite database with artists/aliases tables and uploads to HuggingFace
 
 ### Supporting infrastructure (authorized)
 
-- `pyskeb/client/client.py` — `SkebClient` (also reused inside `test/prepare/`): `iter_art_pages()`, `get_post()`, `iter_user_pages()`, `iter_work_pages()`
+- `pyskeb/client/client.py` — `SkebClient` (also reused inside `test/prepare/`): `get_page()`, `get_post()`, `iter_user_pages()`, `iter_work_pages()`; paced by `min_interval`, raises `SkebRateLimitError` instead of retrying a 429
+- `test/prepare_tests/` — offline unit tests for the flow (`venv/bin/python -m pytest test/prepare_tests -q`); check the pytest exit code itself when chaining commands
 - `test/prepare/base.py` — HuggingFace client/filesystem init, repo creation with LFS, `number_to_tag()` (size buckets), `make_index_file()` (tar index with hashes)
 - `pyskeb/utils/session.py` — `get_requests_session()`, `srequest()` (exponential backoff)
 
 ### Data flow (authorized)
 
-1. **Scrape** — `newest` command → Skeb.jp posts → extract URLs
-2. **Download** — URLs → detect type → temp dir → zip
-3. **Upload** — zip → HuggingFace `unarchived/`
-4. **Repack** — `pack` command → consolidate zips → `packs/`
-5. **Track** — update `archived.json` and `index.json`
+1. **Scrape** — `newest` polls Skeb.jp posts → extract URLs → resolve site handlers
+2. **Download** — handler → temp dir → zip
+3. **Upload** — zip + `state/` in one commit → HuggingFace `unarchived/`
+4. **Repack** — `pack` command (daily) → consolidate zips → `packs/`
+5. **Track** — repacker updates `archived.json` and `index.json`
 
 ### Key design patterns (authorized)
 
@@ -276,12 +277,12 @@ make unittest COV_TYPES="xml term-missing" # with coverage
 - **Idempotency** — checks `archived.json` and `unarchived/` before processing
 - **Filename sanitization** — non-alphanumeric → underscore
 - **Rate limiting** — wait between requests to avoid bans
-- **Error resilience** — try/except with logging, continues on failures
+- **Error resilience** — narrow excepts per failure kind, a retry queue instead of dropping failures, one guarded boundary per resource for handler bugs (they fail the run at its end)
 - **Atomic commits** — HuggingFace operations use commit operations for consistency
 
 ## GitHub Actions Workflows (authorized)
 
-- `newest.yml` — scheduled crawling of newest Skeb posts
+- `newest.yml` — long-running crawl: one run polls for up to 330 minutes and dispatches the next run itself (`GITHUB_TOKEN` dispatches are not delayed by GitHub's degraded schedule); the cron entry is only a watchdog guarded by a `guard` job, and the `newest` job holds a concurrency group so only one crawler runs
 - `repack.yml` — periodic repacking of unarchived files
 - `squash.yml` — archive consolidation
 - `artists.yml` — artist database updates
@@ -293,7 +294,7 @@ When you change a workflow-backed module, validate it with the closest real `pyt
 
 ## Authorized dependencies
 
-Beyond the public set: `huggingface_hub` (dataset uploads), `gdown` (Google Drive), `pyquery` (Imgur HTML parsing), `pandas` (metadata), plus the test plugins `pytest-rerunfailures`, `pytest-timeout`, `pytest-benchmark`.
+Beyond the public set (`requirements-newest.txt` is the minimal set the newest job installs; keep `huggingface_hub<1.0` because `base.py` uses `configure_http_backend`): `huggingface_hub` (dataset uploads), `gdown` (Google Drive), `pandas` (metadata), plus the test plugins `pytest-rerunfailures`, `pytest-timeout`, `pytest-benchmark`.
 
 ## Security and Configuration Notes (authorized)
 

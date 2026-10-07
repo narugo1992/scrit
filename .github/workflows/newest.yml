@@ -1,6 +1,14 @@
 #file: noinspection YAMLSchemaValidation
 name: Newest
 
+# Cadence
+# - A run polls skeb.jp for new posts every 10 minutes for up to 330 minutes, then dispatches the next run
+#   itself (the chain step below), so the crawler is effectively always running. GITHUB_TOKEN dispatches are not
+#   subject to the schedule delays GitHub has had since 2026-08-27.
+# - The cron entry is only a watchdog: it starts a run when the chain is broken. It does nothing while a run is
+#   active, which keeps the run list free of cancelled queue entries.
+# - Posts stay listed for about 3.5 days, so even a long outage is recovered from the cursor in the dataset.
+
 on:
   workflow_dispatch:
     inputs:
@@ -18,24 +26,43 @@ on:
         description: 'Dispatch the next run when this one ends'
         type: boolean
         default: true
-  # the hourly watchdog is switched on once the new flow is verified:
-  #  schedule:
-  #    - cron: '17 * * * *'
-
-# one crawler at a time; a queued run waits instead of cancelling the one in flight
-concurrency:
-  group: newest
-  cancel-in-progress: false
+  schedule:
+    - cron: '23 */3 * * *'
 
 permissions:
   actions: write
   contents: read
 
 jobs:
+  guard:
+    name: Is a run active
+    if: ${{ github.event_name == 'schedule' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      active: ${{ steps.check.outputs.active }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          others=$(gh run list -R "${{ github.repository }}" --workflow newest.yml --limit 30 \
+            --json databaseId,status \
+            --jq '[.[] | select(.databaseId != ${{ github.run_id }}) | select(.status == "in_progress" or .status == "queued" or .status == "pending" or .status == "waiting")] | length')
+          echo "other active newest runs: $others"
+          if [ "$others" -gt 0 ]; then echo "active=true" >> "$GITHUB_OUTPUT"; else echo "active=false" >> "$GITHUB_OUTPUT"; fi
+
   newest:
     name: Newest posts
+    needs: guard
+    if: ${{ !cancelled() && (github.event_name != 'schedule' || needs.guard.outputs.active == 'false') }}
     runs-on: ubuntu-latest
     timeout-minutes: 355
+    # one crawler at a time; a dispatched run waits here instead of cancelling the one in flight
+    concurrency:
+      group: newest
+      cancel-in-progress: false
 
     steps:
       - name: Checkout code
@@ -68,7 +95,7 @@ jobs:
           python -m test.prepare newest --budget-minutes "$BUDGET" --bootstrap "$BOOTSTRAP" $ONCE
       - name: Dispatch the next run
         # chain unless the crawl died right after starting, which would only burn runner minutes
-        if: ${{ always() && github.event.inputs.chain != 'false' && github.event.inputs.once != 'true' }}
+        if: ${{ !cancelled() && github.event.inputs.chain != 'false' && github.event.inputs.once != 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           STARTED: ${{ steps.crawl.outputs.started }}
