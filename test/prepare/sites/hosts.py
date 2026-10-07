@@ -6,6 +6,8 @@ import re
 from typing import List, Optional
 from urllib.parse import urlsplit, urlunsplit, urlencode, parse_qsl
 
+from PIL import Image
+
 from .common import host_of, segments, fetch_file, short_hash, clean_id
 from ..errors import ResourceGone, ResourceTransient, NoContent, UnexpectedResponse
 from ..http import Fetcher
@@ -32,14 +34,33 @@ def _get_text(fx: Fetcher, url: str, **kwargs) -> str:
     return resp.text
 
 
-def _fetch_all(fx: Fetcher, urls: List[str], out_dir: str, stem: str, ext_hint: str = ''):
+_PLACEHOLDER_PRONE = {'ibb.co', 'i.ibb.co', 'postimg.cc', 'i.postimg.cc'}
+_PLACEHOLDER_MAX_SIDE = 200
+
+
+def _check_not_a_placeholder(url: str, path: str):
+    """These hosts hand out a 180px thumbnail with a valid 200 instead of the file when they dislike a request."""
+    if host_of(url) not in _PLACEHOLDER_PRONE:
+        return
+    try:
+        with Image.open(path) as image:
+            width, height = image.size
+    except (OSError, Image.DecompressionBombError):
+        return  # not an image we can read the header of: nothing to compare
+    if max(width, height) <= _PLACEHOLDER_MAX_SIDE:
+        os.remove(path)
+        raise ResourceTransient(f'{url!r} returned a {width}x{height} placeholder instead of the image')
+
+
+def _fetch_all(fx: Fetcher, urls: List[str], out_dir: str):
     if not urls:
-        raise NoContent(f'{stem}: nothing to download')
+        raise NoContent('nothing to download')
     for media_url in urls:
         try:
-            fetch_file(fx, media_url, out_dir)
+            path = fetch_file(fx, media_url, out_dir)
         except UnexpectedResponse as err:
             raise ResourceTransient(str(err)) from err
+        _check_not_a_placeholder(media_url, path)
 
 
 class catbox(_Site):
@@ -57,10 +78,10 @@ class catbox(_Site):
     @staticmethod
     def download(fx, url, out_dir):
         if host_of(url) == 'files.catbox.moe':
-            return _fetch_all(fx, [url], out_dir, 'file')
+            return _fetch_all(fx, [url], out_dir)
         page = _get_text(fx, url)
         files = sorted(set(re.findall(r'https://files\.catbox\.moe/[\w-]+\.\w+', page)))
-        _fetch_all(fx, files[:300], out_dir, 'file')
+        _fetch_all(fx, files[:300], out_dir)
 
 
 class imgchest(_Site):
@@ -78,13 +99,13 @@ class imgchest(_Site):
     @staticmethod
     def download(fx, url, out_dir):
         if host_of(url) == 'cdn.imgchest.com':
-            return _fetch_all(fx, [url], out_dir, 'file')
+            return _fetch_all(fx, [url], out_dir)
         page = _get_text(fx, url)
         found = re.search(r'data-page="([^"]+)"', page)
         if not found:
             raise ResourceGone(f'imgchest page {url!r} has no post data')
         post = ((json.loads(html.unescape(found.group(1))).get('props') or {}).get('post')) or {}
-        _fetch_all(fx, [item['link'] for item in post.get('files') or []][:300], out_dir, 'file')
+        _fetch_all(fx, [item['link'] for item in post.get('files') or []][:300], out_dir)
 
 
 class gyazo(_Site):
@@ -141,16 +162,16 @@ class ibb(_Site):
     def download(fx, url, out_dir):
         host = host_of(url)
         if host == 'i.ibb.co':
-            return _fetch_all(fx, [url], out_dir, 'file')
+            return _fetch_all(fx, [url], out_dir)
         if segments(url)[0] == 'album':
             page = _get_text(fx, url)
             ids = sorted(set(re.findall(r'https://ibb\.co/([A-Za-z0-9]{6,10})"', page)) - _IBB_RESERVED)[:100]
             images = [_og_image(_get_text(fx, f'https://ibb.co/{item}')) for item in ids]
-            return _fetch_all(fx, [item for item in images if item], out_dir, 'file')
+            return _fetch_all(fx, [item for item in images if item], out_dir)
         image = _og_image(_get_text(fx, url))
         if not image:
             raise ResourceGone(f'ibb page {url!r} has no image')
-        _fetch_all(fx, [image], out_dir, 'file')
+        _fetch_all(fx, [image], out_dir)
 
 
 class postimg(_Site):
@@ -171,7 +192,7 @@ class postimg(_Site):
     def download(fx, url, out_dir):
         host, segs = host_of(url), segments(url)
         if host == 'i.postimg.cc':
-            return _fetch_all(fx, [f'{url.split("?")[0]}?dl=1'], out_dir, 'file')
+            return _fetch_all(fx, [f'{url.split("?")[0]}?dl=1'], out_dir)
         if segs[0] == 'gallery':
             listing = fx.post('https://postimg.cc/json', data={'action': 'list', 'album': segs[1], 'page': 1})
             images = listing.json().get('images') or [] if listing.status_code == 200 else []
@@ -186,7 +207,7 @@ class postimg(_Site):
                 links.append(html.unescape(found[0]))
         if not links:
             raise ResourceGone(f'postimg {url!r} has no download link')
-        _fetch_all(fx, links, out_dir, 'file')
+        _fetch_all(fx, links, out_dir)
 
 
 class gphotos(_Site):
@@ -208,7 +229,7 @@ class gphotos(_Site):
                 bases.append(item)
         if not bases:
             raise NoContent(f'google photos share {url!r} exposes no media')
-        _fetch_all(fx, [f'{item}=d' for item in bases[:300]], out_dir, 'photo', '.jpg')
+        _fetch_all(fx, [f'{item}=d' for item in bases[:300]], out_dir)
 
 
 _DIRECT_HOSTS = {'cdn.donmai.us', 'i.pinimg.com', 'file.garden', 'hstorage.io', 'ul.h3z.jp', 'free.picui.cn',
@@ -242,7 +263,7 @@ class direct(_Site):
         if host == 'cdn.donmai.us':
             # Cloudflare in front of the CDN blocks browser-like user agents that lack a browser TLS fingerprint
             return _fetch_all_with_ua(fx, url, out_dir)
-        _fetch_all(fx, [url], out_dir, 'file')
+        _fetch_all(fx, [url], out_dir)
 
 
 def _fetch_all_with_ua(fx: Fetcher, url: str, out_dir: str):

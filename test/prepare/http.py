@@ -17,6 +17,20 @@ from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
 
 from .errors import ResourceTransient, UnexpectedResponse, UnsafeUrl, TooLarge
 
+# Some image hosts answer a request without their own Referer with a tiny placeholder instead of the file, and
+# do so with a perfectly valid 200 and an image content type. The Referer a browser would send is added for them.
+DEFAULT_REFERERS = {
+    'ibb.co': 'https://ibb.co/',
+    'i.ibb.co': 'https://ibb.co/',
+    'postimg.cc': 'https://postimg.cc/',
+    'i.postimg.cc': 'https://postimg.cc/',
+    'i.imgur.com': 'https://imgur.com/',
+    'cdn.imgchest.com': 'https://imgchest.com/',
+    'i.gyazo.com': 'https://gyazo.com/',
+    'files.catbox.moe': 'https://catbox.moe/',
+    'i.pximg.net': 'https://www.pixiv.net/',
+}
+
 MODERN_UA = ('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) '
              'Chrome/129.0.0.0 Safari/537.36')
 
@@ -116,6 +130,7 @@ class Fetcher:
         if public_peers_only is None:
             # a developer machine behind a local proxy needs SCRIT_ALLOW_PRIVATE_PEERS=1; CI never does
             public_peers_only = os.environ.get('SCRIT_ALLOW_PRIVATE_PEERS') != '1'
+        self.public_peers_only = public_peers_only
         if public_peers_only:
             adapter = PublicOnlyAdapter()
             self.session.mount('http://', adapter)
@@ -140,14 +155,16 @@ class Fetcher:
         host = parsed.hostname
         if parsed.scheme not in ('http', 'https') or not host:
             raise UnsafeUrl(f'{url!r}: not an http(s) URL')
-        if time.time() - self._public_hosts.get(host, -_HOST_TTL) < _HOST_TTL:
-            return
         try:
             ipaddress.ip_address(host)
         except ValueError:
             pass
         else:
             raise UnsafeUrl(f'{url!r}: IP literal hosts are refused')
+        if not self.public_peers_only:
+            return  # a proxied development machine resolves names to fake private addresses
+        if time.time() - self._public_hosts.get(host, -_HOST_TTL) < _HOST_TTL:
+            return
         try:
             addresses = {item[4][0] for item in socket.getaddrinfo(host, None)}
         except socket.gaierror as err:
@@ -162,12 +179,20 @@ class Fetcher:
             time.sleep(wait)
         self._last[host] = time.time()
 
+    @staticmethod
+    def _with_referer(url: str, kwargs: dict) -> dict:
+        referer = DEFAULT_REFERERS.get(urlsplit(url).hostname or '')
+        headers = dict(kwargs.get('headers') or {})
+        if referer is None or any(key.lower() == 'referer' for key in headers):
+            return kwargs
+        return {**kwargs, 'headers': {**headers, 'Referer': referer}}
+
     def _send(self, method: str, url: str, follow: bool, kwargs) -> requests.Response:
         """One request, following redirects by hand so that every hop is checked and paced."""
         for _ in range(_MAX_REDIRECTS + 1):
             self.check_public(url)
             self._pace(urlsplit(url).hostname or '')
-            resp = self.session.request(method, url, allow_redirects=False, **kwargs)
+            resp = self.session.request(method, url, allow_redirects=False, **self._with_referer(url, kwargs))
             if not (follow and resp.status_code in _REDIRECT_STATUS and resp.headers.get('Location')):
                 return resp
             url = urljoin(resp.url, resp.headers['Location'])
