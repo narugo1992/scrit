@@ -453,3 +453,20 @@ class TestDroppedAudit:
         for index in range(500):
             store.note_dropped(f'r{index}', 'gone', 'x', '/@a/works/1', limit=300)
         assert len(store.state['dropped']) == 300 and store.state['dropped'][-1]['rid'] == 'r499'
+
+
+@pytest.mark.unittest
+class TestEmptyUnarchivedDirectory:
+    def test_a_missing_directory_means_nothing_is_waiting(self):
+        from huggingface_hub.utils import EntryNotFoundError
+
+        class Client:
+            def list_repo_tree(self, *args, **kwargs):
+                raise EntryNotFoundError("Entry 'unarchived' not found in repository")
+
+            def hf_hub_download(self, **kwargs):
+                raise EntryNotFoundError('archived.json missing')
+
+        store = Store(Client(), 'user/repo')
+        store.refresh()  # must not raise
+        assert store.unarchived == set() and store.archived == set()

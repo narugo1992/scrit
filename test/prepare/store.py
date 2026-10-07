@@ -63,11 +63,18 @@ class Store:
             self.archived = set(self._read_json('archived.json', []))
             self.unarchived = {
                 os.path.splitext(os.path.basename(item.path))[0]
-                for item in self.client.list_repo_tree(self.repo_id, path_in_repo='unarchived', repo_type='dataset')
+                for item in self._list_unarchived()
                 if item.path.endswith('.zip')
             }
             self._index_loaded_at = time.time()
             logging.info(f'Dedupe index loaded: {len(self.archived)} archived, {len(self.unarchived)} unarchived.')
+
+    def _list_unarchived(self):
+        try:
+            return list(self.client.list_repo_tree(self.repo_id, path_in_repo='unarchived', repo_type='dataset'))
+        except EntryNotFoundError:
+            # git keeps no empty directories: unarchived/ vanishes while the repacker has emptied it
+            return []
 
     def load_state(self):
         self.state = self._read_json(STATE_PATH, {})
