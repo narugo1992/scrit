@@ -6,6 +6,7 @@ from hfutils.index import tar_get_index_info
 from huggingface_hub import HfApi, HfFileSystem, configure_http_backend
 
 from pyskeb.utils import get_requests_session
+from .errors import GenericException  # noqa: F401  (kept importable from here)
 
 Image.MAX_IMAGE_PIXELS = 17000 ** 2
 configure_http_backend(get_requests_session)
@@ -15,10 +16,6 @@ hf_client = HfApi(token=hf_token)
 hf_fs = HfFileSystem(token=hf_token)
 
 _REPOSITORY = os.environ['REMOTE_REPOSITORY']
-
-
-class GenericException(Exception):
-    pass
 
 
 def _ensure_repository():

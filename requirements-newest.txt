@@ -1,0 +1,13 @@
+requests
+hbutils>=0.9.0
+hfutils>=0.4.3
+huggingface_hub>=0.23
+gdown==5.1.0
+xurls
+google-re2<1.1.20250722
+pyrfc6266
+random_user_agent
+tqdm
+pillow
+click
+di-toolkit

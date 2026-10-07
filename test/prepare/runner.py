@@ -1,0 +1,314 @@
+import logging
+import os
+import re
+import time
+import traceback
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional, Tuple
+
+import requests
+from hbutils.system import TemporaryDirectory
+
+from pyskeb.client.client import SkebRateLimitError
+from .errors import GenericException, NoContent, ResourceBlocked, ResourceGone, ResourceTransient
+from .http import Fetcher
+from .process import build_zip
+from .sites import resolve
+from .store import CommitFailed, Store
+from .url import extract_urls
+
+# seconds until the next retry of a queued resource, indexed by the number of attempts made so far
+RETRY_DELAYS = [3600, 6 * 3600, 24 * 3600, 3 * 24 * 3600, 7 * 24 * 3600, 14 * 24 * 3600]
+SKEB_BAN_STEPS = [2 * 3600, 4 * 3600, 8 * 3600, 12 * 3600]
+LIST_PAGE_SIZE = 90
+LIST_MAX_OFFSET = 3900
+
+
+def split_post_path(path: str) -> Tuple[str, int]:
+    matching = re.fullmatch(r'/?@(?P<username>[\s\S]+?)/works/(?P<work_id>\d+?)/?', path)
+    return matching.group('username'), int(matching.group('work_id'))
+
+
+class SkebUnavailable(GenericException):
+    """skeb.jp failed in a way that says nothing about the post itself (network error, 5xx)."""
+
+
+@dataclass
+class Job:
+    url: str
+    prefix: str
+    rid: str
+    site: object
+    post: str
+    attempts: int = 0
+    first_seen: float = 0.0
+    last_error: str = ''
+
+
+@dataclass
+class RunConfig:
+    budget_seconds: float = 5.5 * 3600
+    poll_interval: float = 600.0
+    bootstrap: int = 400
+    max_skeb_requests: int = 4500
+    flush_every: int = 20
+    retry_batch: int = 20
+    once: bool = False
+
+
+class Runner:
+    def __init__(self, store: Store, skeb, fx: Fetcher, config: RunConfig,
+                 clock: Callable[[], float] = time.time, sleep: Callable[[float], None] = time.sleep):
+        self.store = store
+        self.skeb = skeb
+        self.fx = fx
+        self.config = config
+        self.clock = clock
+        self.sleep = sleep
+        self.cooldown: Dict[str, float] = {}
+        self.deadline = clock() + config.budget_seconds
+        self.counters: Dict[str, int] = {}
+        self.bugs = 0
+        self.stop_reason = ''
+        self._posts_since_flush = 0
+
+    # ---------------------------------------------------------------- helpers
+    def _count(self, site: str, status: str):
+        self.store.bump(site, status)
+        self.counters[status] = self.counters.get(status, 0) + 1
+
+    def _time_left(self) -> float:
+        return self.deadline - self.clock()
+
+    def _skeb_budget_left(self) -> bool:
+        return self.skeb.request_count < self.config.max_skeb_requests
+
+    # ---------------------------------------------------------------- one resource
+    def _attempt(self, job: Job, workdir: str) -> Tuple[str, Optional[str]]:
+        """Return ``(status, zip_path)``; status is one of ok / dup / gone / empty / deferred / retry / bug."""
+        if self.store.known(job.rid):
+            return 'dup', None
+        until = self.cooldown.get(job.site.NAME, 0.0)
+        if self.clock() < until:
+            job.last_error = 'host cooling down'
+            return 'deferred', None
+
+        zip_path = os.path.join(workdir, f'{job.rid}.zip')
+        try:
+            build_zip(job.site, job.url, job.prefix, zip_path, self.fx)
+        except NoContent as err:
+            logging.info(f'{job.rid}: nothing to archive ({err})')
+            return 'empty', None
+        except ResourceGone as err:
+            logging.info(f'{job.rid}: gone ({err})')
+            return 'gone', None
+        except ResourceBlocked as err:
+            self.cooldown[job.site.NAME] = self.clock() + err.cooldown
+            job.last_error = f'blocked: {err}'
+            logging.warning(f'{job.site.NAME} blocked for {err.cooldown:.0f}s: {err}')
+            return 'retry', None
+        except (ResourceTransient, GenericException) as err:
+            job.last_error = f'transient: {err}'
+            logging.warning(f'{job.rid}: {err}')
+            return 'retry', None
+        except Exception as err:  # noqa: BLE001 - last line of defence at the resource boundary: a bug in one
+            # handler must not stall the cursor of the whole crawl; it is logged loudly and fails the run at exit.
+            job.last_error = f'bug: {err!r}'
+            logging.error(f'{job.rid}: unexpected {err!r}\n{traceback.format_exc()}')
+            print(f'::error title=handler bug::{job.rid}: {err!r}', flush=True)
+            self.bugs += 1
+            return 'bug', None
+        return 'ok', zip_path
+
+    def _queue(self, job: Job, status: str):
+        """Put a failed job into the retry queue, or drop it when it ran out of attempts."""
+        if status in ('retry', 'bug'):
+            job.attempts += 1
+        if job.attempts > len(RETRY_DELAYS):
+            self._count(job.site.NAME, 'expired')
+            self.store.drop_pending(job.rid)
+            logging.info(f'{job.rid}: gave up after {job.attempts} attempts ({job.last_error})')
+            return
+        delay = RETRY_DELAYS[min(max(job.attempts - 1, 0), len(RETRY_DELAYS) - 1)]
+        if status == 'deferred':
+            delay = max(self.cooldown.get(job.site.NAME, 0.0) - self.clock(), 60.0)
+        self.store.add_pending({
+            'rid': job.rid, 'url': job.url, 'prefix': job.prefix, 'post': job.post, 'site': job.site.NAME,
+            'attempts': job.attempts, 'first_seen': job.first_seen, 'last_error': job.last_error[:300],
+            'next_try': self.clock() + delay,
+        })
+
+    def _handle_jobs(self, jobs: List[Job], message: str):
+        """Run the jobs of one post (or one retry batch) and commit everything in a single commit."""
+        zips: Dict[str, str] = {}
+        done_jobs: List[Job] = []
+        with TemporaryDirectory() as td:
+            for job in jobs:
+                status, zip_path = self._attempt(job, td)
+                self._count(job.site.NAME, status)
+                if status == 'ok':
+                    zips[job.rid] = zip_path
+                    done_jobs.append(job)
+                elif status in ('retry', 'bug', 'deferred'):
+                    self._queue(job, status)
+                else:
+                    self.store.drop_pending(job.rid)
+                    self.store.done.add(job.rid)
+            try:
+                self.store.commit(zips, message)
+            except CommitFailed as err:
+                logging.error(str(err))
+                for job in done_jobs:
+                    job.last_error = f'commit failed: {err}'
+                    self._count(job.site.NAME, 'commit_failed')
+                    self._queue(job, 'retry')
+                try:
+                    self.store.commit({}, message + ' (queue after failed commit)')
+                except CommitFailed as state_err:
+                    logging.error(f'state could not be saved either: {state_err}')
+                return
+            for job in done_jobs:
+                self.store.drop_pending(job.rid)
+                self.store.done.add(job.rid)
+                logging.info(f'{job.rid}: uploaded')
+        self._posts_since_flush = 0
+
+    # ---------------------------------------------------------------- one post
+    def process_post(self, path: str):
+        username, work_id = split_post_path(path)
+        try:
+            post = self.skeb.get_post(username, work_id)
+        except SkebRateLimitError:
+            raise
+        except (requests.ConnectionError, requests.Timeout) as err:
+            raise SkebUnavailable(f'{path}: {err!r}') from err
+        except requests.HTTPError as err:
+            if err.response is not None and err.response.status_code >= 500:
+                raise SkebUnavailable(f'{path}: {err!r}') from err
+            logging.warning(f'{path}: cannot read the post ({err}), skipped')
+            self.store.push_head(path)
+            return
+
+        text = f"{post.get('source_body') or ''}\n{post.get('body') or ''}"
+        jobs: List[Job] = []
+        seen = set()
+        for url in extract_urls(text):
+            resolved = resolve(url)
+            if resolved is None:
+                self.store.bump('unsupported', 'urls')
+                continue
+            site, rid = resolved
+            if rid in seen:
+                continue
+            seen.add(rid)
+            jobs.append(Job(url=url, prefix=f'{username}_{work_id}_', rid=rid, site=site, post=path,
+                            first_seen=self.clock()))
+        logging.info(f'{path}: {len(jobs)} supported resource(s)')
+
+        self.store.push_head(path)
+        if jobs:
+            self._handle_jobs(jobs, f'newest: {path} +{len(jobs)} resource(s)')
+        else:
+            self._posts_since_flush += 1
+            if self._posts_since_flush >= self.config.flush_every:
+                self.store.commit({}, 'newest: update state')
+                self._posts_since_flush = 0
+
+    # ---------------------------------------------------------------- queue
+    def process_pending(self):
+        now = self.clock()
+        due = [item for item in self.store.pending if item['next_try'] <= now][:self.config.retry_batch]
+        for item in due:
+            if self._time_left() < 120:
+                break
+            resolved = resolve(item['url'])
+            if resolved is None:
+                self.store.drop_pending(item['rid'])
+                continue
+            site, rid = resolved
+            job = Job(url=item['url'], prefix=item['prefix'], rid=rid, site=site, post=item['post'],
+                      attempts=item['attempts'], first_seen=item['first_seen'], last_error=item['last_error'])
+            self._handle_jobs([job], f'newest: retry {rid} (attempt {job.attempts + 1})')
+
+    # ---------------------------------------------------------------- listing
+    def collect_new_posts(self) -> List[str]:
+        """Paths of posts newer than the cursor, newest first."""
+        head = set(self.store.head)
+        fresh: List[str] = []
+        seen = set()
+        known_streak = 0
+        offset = 0
+        while offset < LIST_MAX_OFFSET and self._skeb_budget_left():
+            items = self.skeb.get_page(offset, LIST_PAGE_SIZE)
+            if not items:
+                break
+            for item in items:
+                path = item['path']
+                if path in head:
+                    known_streak += 1
+                    if known_streak >= 3:
+                        return fresh
+                    continue
+                known_streak = 0
+                if path not in seen:
+                    seen.add(path)
+                    fresh.append(path)
+            offset += len(items)
+            if not head and len(fresh) >= self.config.bootstrap:
+                return fresh[:self.config.bootstrap]
+        return fresh
+
+    # ---------------------------------------------------------------- skeb ban handling
+    def _skeb_blocked(self) -> float:
+        return float(self.store.state['skeb'].get('blocked_until') or 0.0)
+
+    def _register_ban(self):
+        streak = int(self.store.state['skeb'].get('ban_streak') or 0)
+        wait = SKEB_BAN_STEPS[min(streak, len(SKEB_BAN_STEPS) - 1)]
+        self.store.set_skeb(blocked_until=self.clock() + wait, ban_streak=streak + 1, last_ban=self.clock())
+        logging.error(f'Skeb answered 429; no request to skeb.jp for the next {wait / 3600:.0f}h.')
+        print(f'::warning title=skeb rate limited::paused skeb.jp requests for {wait / 3600:.0f}h', flush=True)
+
+    # ---------------------------------------------------------------- main loop
+    def cycle(self) -> int:
+        """One poll: list new posts, process them oldest first, then work the retry queue."""
+        processed = 0
+        if self.clock() >= self._skeb_blocked() and self._skeb_budget_left():
+            try:
+                fresh = self.collect_new_posts()
+                logging.info(f'{len(fresh)} new post(s) to process.')
+                for path in reversed(fresh):
+                    if self._time_left() < 180 or not self._skeb_budget_left():
+                        self.stop_reason = self.stop_reason or 'budget'
+                        break
+                    self.process_post(path)
+                    processed += 1
+                if self.store.state['skeb'].get('ban_streak'):
+                    self.store.set_skeb(ban_streak=0)
+            except SkebRateLimitError:
+                self._register_ban()
+            except SkebUnavailable as err:
+                logging.warning(f'skeb.jp unavailable, the rest waits for the next poll: {err}')
+                self.stop_reason = 'skeb unavailable'
+        self.process_pending()
+        self.store.commit({}, 'newest: update state')
+        return processed
+
+    def run(self):
+        self.store.refresh()
+        self.store.load_state()
+        while True:
+            self.store.refresh()
+            self.cycle()
+            if self.config.once or self._time_left() < self.config.poll_interval + 180:
+                break
+            self.stop_reason = ''
+            self.sleep(self.config.poll_interval)
+        self.store.commit({}, 'newest: update state')
+
+    def summary(self) -> str:
+        lines = [f'newest run finished ({self.stop_reason or "time budget reached"}), '
+                 f'skeb requests: {self.skeb.request_count}, bugs: {self.bugs}',
+                 'this run: ' + ', '.join(f'{k}={v}' for k, v in sorted(self.counters.items())),
+                 f'pending queue: {len(self.store.pending)}']
+        return '\n'.join(lines)

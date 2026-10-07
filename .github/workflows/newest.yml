@@ -2,78 +2,90 @@
 name: Newest
 
 on:
-  #  push:
   workflow_dispatch:
-  # schedule paused while the pipeline is being reworked; runs are triggered manually
+    inputs:
+      budget_minutes:
+        description: 'Minutes to keep polling before the run ends cleanly'
+        default: '330'
+      bootstrap:
+        description: 'Posts to take when the repository has no cursor yet'
+        default: '400'
+      once:
+        description: 'Run a single poll and exit'
+        type: boolean
+        default: false
+      chain:
+        description: 'Dispatch the next run when this one ends'
+        type: boolean
+        default: true
+  # the hourly watchdog is switched on once the new flow is verified:
   #  schedule:
-  #    - cron: '*/15 * * * *'
+  #    - cron: '17 * * * *'
+
+# one crawler at a time; a queued run waits instead of cancelling the one in flight
+concurrency:
+  group: newest
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
 
 jobs:
-  unittest:
-    name: Code Test Newest
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - 'ubuntu-latest'
-        python-version:
-          - '3.8'
+  newest:
+    name: Newest posts
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
 
     steps:
-      - name: Get system version for Linux
-        if: ${{ contains(matrix.os, 'ubuntu') }}
-        shell: bash
-        run: |
-          echo "OS_NAME=Linux" >> $GITHUB_ENV
-          echo "IS_WIN=" >> $GITHUB_ENV
-          echo "IS_MAC=" >> $GITHUB_ENV
-      - name: Set environment for Cpython
-        if: ${{ !contains(matrix.python-version, 'pypy') }}
-        shell: bash
-        run: |
-          echo "IS_PYPY=" >> $GITHUB_ENV
       - name: Checkout code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
+      - name: Set up python
+        uses: actions/setup-python@v5
         with:
-          fetch-depth: 20
-          submodules: 'recursive'
-      - name: Set up system dependences on Linux
-        if: ${{ env.OS_NAME == 'Linux' }}
-        shell: bash
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y tree cloc wget curl make zip
-          sudo apt-get install -y git-lfs
-      - name: Set up python ${{ matrix.python-version }}
-        uses: actions/setup-python@v2
-        with:
-          python-version: ${{ matrix.python-version }}
+          python-version: '3.10'
+          cache: pip
+          cache-dependency-path: requirements-newest.txt
       - name: Install dependencies
         shell: bash
         run: |
           python -m pip install --upgrade pip
-          pip install --upgrade flake8 setuptools wheel twine
-          pip install -r requirements.txt
-          pip install -r requirements-test.txt
-          pip install -r requirements-extra.txt
-      - name: Test the basic environment
-        shell: bash
-        run: |
-          python -V
-          pip --version
-          pip list
-          tree .
-          cloc pyskeb
-          cloc test
-      - name: Run unittest
+          pip install -r requirements-newest.txt
+      - name: Crawl
+        id: crawl
         env:
           CI: 'true'
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_ENDPOINT: ${{ secrets.HF_ENDPOINT }}
           REMOTE_REPOSITORY: ${{ secrets.REMOTE_REPOSITORY }}
+          BUDGET: ${{ github.event.inputs.budget_minutes || '330' }}
+          BOOTSTRAP: ${{ github.event.inputs.bootstrap || '400' }}
+          ONCE: ${{ github.event.inputs.once == 'true' && '--once' || '' }}
         shell: bash
-        timeout-minutes: 10
         continue-on-error: true
         run: |
-          python -m test.prepare newest -n 100
+          echo "started=$(date +%s)" >> "$GITHUB_OUTPUT"
+          python -m test.prepare newest --budget-minutes "$BUDGET" --bootstrap "$BOOTSTRAP" $ONCE
+      - name: Dispatch the next run
+        # chain unless the crawl died right after starting, which would only burn runner minutes
+        if: ${{ always() && github.event.inputs.chain != 'false' && github.event.inputs.once != 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STARTED: ${{ steps.crawl.outputs.started }}
+          OUTCOME: ${{ steps.crawl.outcome }}
+        shell: bash
+        run: |
+          elapsed=$(( $(date +%s) - ${STARTED:-$(date +%s)} ))
+          if [ "$OUTCOME" = "failure" ] && [ "$elapsed" -lt 900 ]; then
+            echo "::warning::the crawl failed after ${elapsed}s, not chaining; the watchdog will start the next run"
+            exit 0
+          fi
+          gh workflow run newest.yml -R "${{ github.repository }}" \
+            -f budget_minutes="${{ github.event.inputs.budget_minutes || '330' }}" \
+            -f bootstrap="${{ github.event.inputs.bootstrap || '400' }}"
+      - name: Report the crawl result
+        if: ${{ steps.crawl.outcome == 'failure' }}
+        shell: bash
+        run: |
+          echo "::error::the crawl step failed, see its log"
+          exit 1
