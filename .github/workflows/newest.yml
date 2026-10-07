@@ -1,12 +1,16 @@
 #file: noinspection YAMLSchemaValidation
 name: Newest
+run-name: Newest${{ github.event.inputs.once == 'true' && ' (once)' || '' }}${{ github.event.inputs.chain == 'false' && ' (no chain)' || '' }}
 
 # Cadence
-# - A run polls skeb.jp for new posts every 10 minutes for up to 330 minutes, then dispatches the next run
-#   itself (the chain step below), so the crawler is effectively always running. GITHUB_TOKEN dispatches are not
-#   subject to the schedule delays GitHub has had since 2026-08-27.
-# - The cron entry is only a watchdog: it starts a run when the chain is broken. It does nothing while a run is
-#   active, which keeps the run list free of cancelled queue entries.
+# - A run polls skeb.jp for new posts every 10 minutes for up to 330 minutes, then dispatches the next run itself
+#   (the chain step below), so the crawler is effectively always running. GITHUB_TOKEN dispatches are not subject
+#   to the schedule delays GitHub has had since 2026-08-27, which is why no cron entry is used.
+# - If a run ends without dispatching its successor (the runner was lost), newest_resume.yml notices the run
+#   finishing and starts a new one. Cancelling a run is the way to stop the crawler: neither the chain step nor
+#   the resume workflow act on a cancelled run.
+# - Only one crawler runs at a time: the concurrency group queues a dispatched run until the previous one has
+#   ended, and the crawler also holds a lease in the dataset (state/lease.json).
 # - Posts stay listed for about 3.5 days, so even a long outage is recovered from the cursor in the dataset.
 
 on:
@@ -19,44 +23,21 @@ on:
         description: 'Posts to take when the repository has no cursor yet'
         default: '400'
       once:
-        description: 'Run a single poll and exit'
+        description: 'Run a single poll and exit (no chain, no resume)'
         type: boolean
         default: false
       chain:
-        description: 'Dispatch the next run when this one ends'
+        description: 'Dispatch the next run when this one ends (off: no resume either)'
         type: boolean
         default: true
-  schedule:
-    - cron: '23 */3 * * *'
 
 permissions:
   actions: write
   contents: read
 
 jobs:
-  guard:
-    name: Is a run active
-    if: ${{ github.event_name == 'schedule' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      active: ${{ steps.check.outputs.active }}
-    steps:
-      - id: check
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          others=$(gh run list -R "${{ github.repository }}" --workflow newest.yml --limit 30 \
-            --json databaseId,status \
-            --jq '[.[] | select(.databaseId != ${{ github.run_id }}) | select(.status == "in_progress" or .status == "queued" or .status == "pending" or .status == "waiting")] | length')
-          echo "other active newest runs: $others"
-          if [ "$others" -gt 0 ]; then echo "active=true" >> "$GITHUB_OUTPUT"; else echo "active=false" >> "$GITHUB_OUTPUT"; fi
-
   newest:
     name: Newest posts
-    needs: guard
-    if: ${{ !cancelled() && (github.event_name != 'schedule' || needs.guard.outputs.active == 'false') }}
     runs-on: ubuntu-latest
     timeout-minutes: 355
     # one crawler at a time; a dispatched run waits here instead of cancelling the one in flight
@@ -92,10 +73,15 @@ jobs:
         continue-on-error: true
         run: |
           echo "started=$(date +%s)" >> "$GITHUB_OUTPUT"
+          set +e
           python -m test.prepare newest --budget-minutes "$BUDGET" --bootstrap "$BOOTSTRAP" $ONCE
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          exit $code
       - name: Dispatch the next run
+        # exit code 4 means another crawler holds the lease: that one is alive, so there is nothing to continue
         # chain unless the crawl died right after starting, which would only burn runner minutes
-        if: ${{ !cancelled() && github.event.inputs.chain != 'false' && github.event.inputs.once != 'true' }}
+        if: ${{ !cancelled() && github.event.inputs.chain != 'false' && github.event.inputs.once != 'true' && steps.crawl.outputs.code != '4' }}
         env:
           GH_TOKEN: ${{ github.token }}
           STARTED: ${{ steps.crawl.outputs.started }}
@@ -104,14 +90,14 @@ jobs:
         run: |
           elapsed=$(( $(date +%s) - ${STARTED:-$(date +%s)} ))
           if [ "$OUTCOME" = "failure" ] && [ "$elapsed" -lt 900 ]; then
-            echo "::warning::the crawl failed after ${elapsed}s, not chaining; the watchdog will start the next run"
+            echo "::warning::the crawl failed after ${elapsed}s, not chaining"
             exit 0
           fi
           gh workflow run newest.yml -R "${{ github.repository }}" \
             -f budget_minutes="${{ github.event.inputs.budget_minutes || '330' }}" \
             -f bootstrap="${{ github.event.inputs.bootstrap || '400' }}"
       - name: Report the crawl result
-        if: ${{ steps.crawl.outcome == 'failure' }}
+        if: ${{ steps.crawl.outcome == 'failure' && steps.crawl.outputs.code != '4' }}
         shell: bash
         run: |
           echo "::error::the crawl step failed, see its log"

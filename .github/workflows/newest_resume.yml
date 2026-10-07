@@ -1,0 +1,47 @@
+#file: noinspection YAMLSchemaValidation
+name: Newest resume
+
+# Safety net for the self-chaining Newest workflow. It is an event (a run finished), not a cron entry, so it does
+# not suffer from GitHub's delayed schedules. Normally the finished run has dispatched its successor already and
+# this does nothing.
+
+on:
+  workflow_run:
+    workflows: [Newest]
+    types: [completed]
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  resume:
+    name: Start a run if none is going
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # a cancelled run is a deliberate stop; (once) and (no chain) runs are debugging runs
+    if: ${{ github.event.workflow_run.conclusion != 'cancelled' && !contains(github.event.workflow_run.display_title, '(once)') && !contains(github.event.workflow_run.display_title, '(no chain)') }}
+    steps:
+      - name: Resume
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FINISHED: ${{ github.event.workflow_run.id }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          STARTED_AT: ${{ github.event.workflow_run.run_started_at }}
+          ENDED_AT: ${{ github.event.workflow_run.updated_at }}
+        shell: bash
+        run: |
+          others=$(gh run list -R "${{ github.repository }}" --workflow newest.yml --limit 20 --json databaseId,status \
+            --jq "[.[] | select(.databaseId != $FINISHED) | select(.status == \"in_progress\" or .status == \"queued\" or .status == \"pending\" or .status == \"waiting\")] | length")
+          echo "finished run $FINISHED ($CONCLUSION), other active newest runs: $others"
+          if [ "$others" -gt 0 ]; then
+            echo "a run is already going or queued, nothing to do"
+            exit 0
+          fi
+          lasted=$(( $(date -d "$ENDED_AT" +%s) - $(date -d "$STARTED_AT" +%s) ))
+          if [ "$CONCLUSION" = "failure" ] && [ "$lasted" -lt 900 ]; then
+            echo "::warning::the last run failed after ${lasted}s, not restarting (a crash loop would only burn minutes)"
+            exit 0
+          fi
+          echo "::notice::no newest run is active, starting one"
+          gh workflow run newest.yml -R "${{ github.repository }}"
