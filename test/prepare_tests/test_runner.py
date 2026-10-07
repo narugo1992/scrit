@@ -316,7 +316,7 @@ class TestFailureListIsCommittedWithEveryUpload:
     def test_cursor_is_flushed_after_a_quiet_period_even_without_resources(self, env):
         site, clock, make = env
         listing = paths(3)
-        runner, store, skeb = make(listing, {}, flush_every=1000)
+        runner, store, skeb = make(listing, {listing[0]: 'no links here'}, flush_every=1000)
         store.last_commit_at = time.time() - 1000
         runner.process_post(listing[0])
         assert any('state/newest.json' in c['paths'] for c in store.client.commits)
