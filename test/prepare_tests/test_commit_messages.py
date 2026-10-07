@@ -80,3 +80,12 @@ class TestCrawlerCommitMessages:
         store.acquire_lease('run-1', sleep=lambda s: None)
         store.release_lease('run-1')
         assert titles(store) == ['[lease] held by run local', '[lease] released']
+
+
+@pytest.mark.unittest
+def test_resources_that_are_already_archived_are_said_so(env):
+    site, clock, make = env[0], env[1], env[2]
+    listing = paths(1)
+    runner, store, skeb = make(listing, {listing[0]: 'https://fake.test/seen'}, store=MemStore(archived=['fake_seen']))
+    runner.cycle()
+    assert titles(store)[0] == '[new] @u1/works/1 | +0 res, 1 already archived | 0 posts waiting'

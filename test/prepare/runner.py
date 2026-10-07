@@ -157,7 +157,8 @@ class Runner:
             'next_try': self.clock() + delay,
         })
 
-    def _title(self, kind: str, label: str, jobs: List[Job], zips: Dict[str, str], gone: int, queued: int) -> str:
+    def _title(self, kind: str, label: str, jobs: List[Job], zips: Dict[str, str], gone: int, queued: int,
+               dup: int = 0) -> str:
         """``[new] @user/works/12 | +2 res, 48.3 MiB (googledrive 1, imgur 1) | 37 posts waiting``"""
         uploaded = [job for job in jobs if job.rid in zips]
         if uploaded:
@@ -165,8 +166,8 @@ class Runner:
             got = f'+{len(uploaded)} res, {pretty_size(total)} ({by_site(job.site.NAME for job in uploaded)})'
         else:
             got = '+0 res'
-        notes = [text for text in (f'{gone} gone or empty' if gone else '', f'{queued} queued for retry' if queued else '')
-                 if text]
+        notes = [text for text in (f'{dup} already archived' if dup else '', f'{gone} gone or empty' if gone else '',
+                                   f'{queued} queued for retry' if queued else '') if text]
         title = f'[{kind}] {label} | {got}' + (', ' + ', '.join(notes) if notes else '')
         if kind != 'retry':
             title += f' | {plural(len(self.store.backlog), "post")} waiting'
@@ -176,7 +177,7 @@ class Runner:
         """Run the jobs of one post (or one retry) and commit everything in a single commit."""
         zips: Dict[str, str] = {}
         done_jobs: List[Job] = []
-        gone = queued = 0
+        gone = queued = dup = 0
         with TemporaryDirectory() as td:
             for job in jobs:
                 status, zip_path = self._attempt(job, td)
@@ -184,6 +185,10 @@ class Runner:
                 if status == 'ok':
                     zips[job.rid] = zip_path
                     done_jobs.append(job)
+                elif status == 'dup':
+                    dup += 1
+                    self.store.drop_pending(job.rid)
+                    self.store.done.add(job.rid)
                 elif status in ('retry', 'bug', 'deferred'):
                     self._queue(job, status)
                     queued += 1
@@ -193,7 +198,7 @@ class Runner:
                     if status in ('gone', 'empty'):
                         self.store.note_dropped(job.rid, status, job.last_error, job.post)
                         gone += 1
-            message = self._title(kind, label, jobs, zips, gone, queued)
+            message = self._title(kind, label, jobs, zips, gone, queued, dup)
             description = '\n'.join(f'{rid}  {pretty_size(os.path.getsize(path))}' for rid, path in zips.items())
             try:
                 self.store.commit(zips, message, description)
