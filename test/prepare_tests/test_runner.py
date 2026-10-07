@@ -848,3 +848,35 @@ class TestEndingSafely:
         with pytest.raises(ResourceTransient):
             fx.download('https://example.com/a.png', str(tmp_path / 'a'))
         assert not (tmp_path / 'a').exists()
+
+
+@pytest.mark.unittest
+class TestHistorySeeding:
+    @staticmethod
+    def _history(store, *urls):
+        import json
+        items = [{'url': url, 'post': ['alice', 7], 'prefix': 'alice_7_', 'kinds': ['drive_quota']} for url in urls]
+        store.client.files['state/failed_history.json'] = json.dumps({'items': items}).encode()
+
+    def test_old_failures_are_queued_once_and_retried_after_fresh_posts(self, env):
+        site, clock, make = env
+        store = MemStore(archived={'fake_done'})
+        self._history(store, 'https://fake.test/a', 'https://fake.test/done', 'https://nowhere.test/x')
+        listing = paths(1)
+        runner, store, skeb = make(listing, {listing[0]: 'https://fake.test/fresh'}, store=store)
+
+        assert runner.seed_from_history() == 1  # archived and unsupported ones are skipped
+        assert [item['rid'] for item in store.pending] == ['fake_a']
+        assert store.pending[0]['post'] == '/@alice/works/7' and store.pending[0]['attempts'] == 0
+        assert store.state['history_seeded'] and store.dirty
+        assert runner.seed_from_history() == 0  # only once
+
+        runner.cycle()
+        assert site.calls[:2] == ['https://fake.test/fresh', 'https://fake.test/a']  # fresh post first
+        assert store.pending == []
+
+    def test_missing_history_file_is_harmless(self, env):
+        site, clock, make = env
+        runner, store, skeb = make([], {})
+        assert runner.seed_from_history() == 0
+        assert store.pending == []

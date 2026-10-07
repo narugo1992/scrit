@@ -17,6 +17,7 @@ HEAD_SIZE = 600
 PENDING_LIMIT = 3000
 COMMIT_ATTEMPTS = 6
 LEASE_PATH = 'state/lease.json'
+HISTORY_PATH = 'state/failed_history.json'
 LEASE_TTL = 45 * 60.0       # a holder that stopped refreshing this long ago is considered dead
 LEASE_SETTLE = 20.0         # time two contenders get to write before the winner is read back
 BACKLOG_LIMIT = 8000
@@ -170,6 +171,10 @@ class Store:
         self.pending.append(item)
         del self.pending[:-PENDING_LIMIT]
         self._dirty_pending = True
+
+    def read_failed_history(self) -> List[Dict]:
+        """Failures recorded before the 2026-10 rework (empty when the file is missing)."""
+        return (self._read_json(HISTORY_PATH, {}) or {}).get('items', [])
 
     def drop_pending(self, resource_id: str):
         before = len(self.pending)

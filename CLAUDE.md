@@ -235,7 +235,7 @@ make unittest COV_TYPES="xml term-missing" # with coverage
 - failures go to `state/pending.json` with growing delays (1h, 6h, 1d, 3d, 7d, 14d), a blocked host is cooled down (25 min) and its remaining resources are queued without being tried
 - skeb.jp is paced (2.5s between requests, at most 4500 per run); a 429 pauses all skeb requests for 2h/4h/8h/12h (stored in the state) and never triggers retries
 - works linked from posts (`skeb.jp/@user/works/N`) are crawled once as an extra source, without moving the cursor
-- `state/failed_history.json` records the failures seen before the 2026-10 rework (not read by the code)
+- `state/failed_history.json` records the failures seen before the 2026-10 rework; on its first start a run queues them once into `state/pending.json` (`history_seeded` in `state/newest.json`, attempts reset, due at once) so they are retried with the current fetchers, after every fresh post
 
 **2. URL extraction and packing** (`url.py`, `process.py`)
 - `extract_urls()` cuts every URL at its first non-ASCII character (Japanese text is often glued to links)

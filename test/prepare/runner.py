@@ -311,6 +311,34 @@ class Runner:
                       attempts=item['attempts'], first_seen=item['first_seen'], last_error=item['last_error'])
             self._handle_jobs([job], 'retry', f'{rid} (attempt {job.attempts + 1}, from {job.post.lstrip("/")})')
 
+    def seed_from_history(self) -> int:
+        """Queue the failures recorded before the rework once, so they are retried with the current fetchers.
+
+        They go in with a clean attempt count and are due at once; the queue is only worked when no fresh post
+        is waiting, so they never delay new posts. Returns the number of resources queued.
+        """
+        if self.store.state.get('history_seeded'):
+            return 0
+        queued = 0
+        for item in self.store.read_failed_history():
+            resolved = resolve(item['url'])
+            if resolved is None:
+                continue
+            site, rid = resolved
+            if self.store.known(rid) or any(old['rid'] == rid for old in self.store.pending):
+                continue
+            username, work_id = item['post']
+            self.store.add_pending({
+                'rid': rid, 'url': item['url'], 'prefix': item['prefix'], 'post': f'/@{username}/works/{work_id}',
+                'site': site.NAME, 'attempts': 0, 'first_seen': self.clock(),
+                'last_error': ','.join(item.get('kinds') or [])[:300], 'next_try': 0.0,
+            })
+            queued += 1
+        self.store.state['history_seeded'] = True
+        self.store._dirty_state = True
+        logging.info(f'Queued {queued} failures from before the rework for a retry.')
+        return queued
+
     # ---------------------------------------------------------------- listing
     def _page(self, offset: int) -> List[Dict]:
         try:
@@ -461,6 +489,7 @@ class Runner:
         if self.use_lease:
             self.store.acquire_lease(self.holder)
             self._last_lease = self.clock()
+        self.seed_from_history()
         if self.config.hard_deadline:
             self._arm_hard_deadline()
         try:
