@@ -33,10 +33,13 @@ def newest(budget_minutes, poll_seconds, bootstrap, max_skeb_requests, skeb_inte
     from .http import Fetcher
     from .runner import Runner, RunConfig
     from .store import Store, LeaseUnavailable
+    from .ci import github_run_finished
 
     _ensure_repository()
+    store = Store(hf_client, _REPOSITORY)
+    store.holder_finished = github_run_finished
     runner = Runner(
-        store=Store(hf_client, _REPOSITORY),
+        store=store,
         skeb=SkebClient(min_interval=skeb_interval),
         fx=Fetcher(),
         config=RunConfig(budget_seconds=budget_minutes * 60, poll_interval=poll_seconds, bootstrap=bootstrap,

@@ -63,6 +63,7 @@ jobs:
         id: crawl
         env:
           CI: 'true'
+          GITHUB_TOKEN: ${{ github.token }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_ENDPOINT: ${{ secrets.HF_ENDPOINT }}
           REMOTE_REPOSITORY: ${{ secrets.REMOTE_REPOSITORY }}

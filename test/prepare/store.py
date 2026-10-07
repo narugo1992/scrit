@@ -3,7 +3,7 @@ import json
 import logging
 import os
 import time
-from typing import Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set
 
 import requests
 from huggingface_hub import CommitOperationAdd
@@ -54,6 +54,8 @@ class Store:
         self._dirty_pending = False
         self._index_loaded_at = 0.0
         self.last_commit_at = time.time()
+        # tells whether the run that wrote a lease has ended, so a cancelled or lost run does not block its successor
+        self.holder_finished: Callable[[str], bool] = lambda run_id: False
 
     # ------------------------------------------------------------ reading
     def _read_json(self, path: str, default):
@@ -231,7 +233,14 @@ class Store:
             f'[lease] held by run {body["run"] or "local"}' if holder else '[lease] released')
 
     def _held_by_other(self, lease: Dict, holder: str) -> bool:
-        return bool(lease.get('holder')) and lease['holder'] != holder and time.time() - lease.get('at', 0) <= LEASE_TTL
+        if not lease.get('holder') or lease['holder'] == holder:
+            return False
+        if time.time() - lease.get('at', 0) > LEASE_TTL:
+            return False
+        if lease.get('run') and self.holder_finished(lease['run']):
+            logging.info(f'The run {lease["run"]} that held the lease has ended, taking it over.')
+            return False
+        return True
 
     def acquire_lease(self, holder: str, wait_limit: float = LEASE_TTL + 300,
                       sleep=time.sleep, settle: float = LEASE_SETTLE):

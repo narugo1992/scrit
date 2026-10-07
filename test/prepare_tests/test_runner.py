@@ -666,3 +666,57 @@ class TestLease:
         store.keep_lease = lambda holder: False  # somebody else took over
         runner.run()
         assert runner.stop_reason == 'lease lost' and site.calls == []
+
+
+@pytest.mark.unittest
+class TestLeaseOfAFinishedRun:
+    def test_a_lease_of_a_cancelled_run_is_taken_over_at_once(self):
+        import json
+        client = FakeClient()
+        client.files['state/lease.json'] = json.dumps({'holder': 'old-1', 'at': time.time(), 'run': '12345'}).encode()
+        store = MemStore()
+        store.client = client
+        store.holder_finished = lambda run_id: run_id == '12345'
+        waits = []
+        store.acquire_lease('new-2', sleep=waits.append)
+        assert store.read_lease()['holder'] == 'new-2' and 30.0 not in waits  # no waiting between attempts
+
+    def test_a_lease_of_a_running_run_is_respected(self):
+        import json
+        from test.prepare.store import LeaseUnavailable
+        client = FakeClient()
+        client.files['state/lease.json'] = json.dumps({'holder': 'old-1', 'at': time.time(), 'run': '12345'}).encode()
+        store = MemStore()
+        store.client = client
+        store.holder_finished = lambda run_id: False
+        with pytest.raises(LeaseUnavailable):
+            store.acquire_lease('new-2', wait_limit=0.0, sleep=lambda s: None)
+
+    def test_the_github_check_is_conservative(self, monkeypatch):
+        import requests as rq
+        from test.prepare import ci
+        monkeypatch.delenv('GITHUB_REPOSITORY', raising=False)
+        assert ci.github_run_finished('123') is False  # not on GitHub: unknown means not finished
+        monkeypatch.setenv('GITHUB_REPOSITORY', 'a/b')
+        monkeypatch.setenv('GITHUB_TOKEN', 'x')
+
+        class Resp:
+            def __init__(self, status, body):
+                self.status_code, self._body = status, body
+
+            def json(self):
+                return self._body
+
+        monkeypatch.setattr(ci.requests, 'get', lambda *a, **k: Resp(200, {'status': 'completed'}))
+        assert ci.github_run_finished('123') is True
+        monkeypatch.setattr(ci.requests, 'get', lambda *a, **k: Resp(200, {'status': 'in_progress'}))
+        assert ci.github_run_finished('123') is False
+        monkeypatch.setattr(ci.requests, 'get', lambda *a, **k: Resp(404, {}))
+        assert ci.github_run_finished('123') is False
+
+        def boom(*a, **k):
+            raise rq.ConnectionError('x')
+
+        monkeypatch.setattr(ci.requests, 'get', boom)
+        assert ci.github_run_finished('123') is False
+        assert ci.github_run_finished('local') is False  # not a numeric run id
