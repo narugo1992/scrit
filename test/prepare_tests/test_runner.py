@@ -431,3 +431,25 @@ class TestSkebTimeouts:
         assert closed == [1]
         client._get('/api/works')
         assert closed == [1]  # a request right after another one keeps the connection
+
+
+@pytest.mark.unittest
+class TestDroppedAudit:
+    def test_given_up_resources_are_listed_with_their_reason(self, env):
+        site, clock, make = env
+        listing = paths(2)
+        site.behaviour = {'https://fake.test/dead': ResourceGone('HTTP 404 for the thing'), 'https://fake.test/blank': NoContent('no media')}
+        posts = {listing[1]: 'https://fake.test/dead', listing[0]: 'https://fake.test/blank'}
+        runner, store, skeb = make(listing, posts)
+        runner.cycle()
+        dropped = {item['rid']: item for item in store.state['dropped']}
+        assert dropped['fake_dead']['status'] == 'gone' and 'HTTP 404' in dropped['fake_dead']['why']
+        assert dropped['fake_blank']['status'] == 'empty'
+        assert dropped['fake_dead']['post'].startswith('/@')
+
+    def test_audit_list_is_bounded(self, env):
+        site, clock, make = env
+        runner, store, skeb = make(paths(1), {})
+        for index in range(500):
+            store.note_dropped(f'r{index}', 'gone', 'x', '/@a/works/1', limit=300)
+        assert len(store.state['dropped']) == 300 and store.state['dropped'][-1]['rid'] == 'r499'

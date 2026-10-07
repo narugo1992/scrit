@@ -102,9 +102,11 @@ class Runner:
             build_zip(job.site, job.url, job.prefix, zip_path, self.fx)
         except NoContent as err:
             logging.info(f'{job.rid}: nothing to archive ({err})')
+            job.last_error = str(err)
             return 'empty', None
         except ResourceGone as err:
             logging.info(f'{job.rid}: gone ({err})')
+            job.last_error = str(err)
             return 'gone', None
         except ResourceBlocked as err:
             self.cooldown[job.site.NAME] = self.clock() + err.cooldown
@@ -158,6 +160,8 @@ class Runner:
                 else:
                     self.store.drop_pending(job.rid)
                     self.store.done.add(job.rid)
+                    if status in ('gone', 'empty'):
+                        self.store.note_dropped(job.rid, status, job.last_error, job.post)
             try:
                 self.store.commit(zips, message)
             except CommitFailed as err:

@@ -100,6 +100,14 @@ class Store:
             bucket[status] = bucket.get(status, 0) + amount
         self._dirty_state = True
 
+    def note_dropped(self, resource_id: str, status: str, reason: str, post: str, limit: int = 300):
+        """Keep the latest resources that were given up on, so a wrong 'gone' can be audited afterwards."""
+        dropped = self.state.setdefault('dropped', [])
+        dropped.append({'rid': resource_id, 'status': status, 'why': reason[:160], 'post': post,
+                        'at': _now_text()})
+        del dropped[:-limit]
+        self._dirty_state = True
+
     def note_unsupported(self, host: str):
         """Count links to hosts without a handler, to see which site is worth adding next."""
         hosts = self.state.setdefault('unsupported_hosts', {})
