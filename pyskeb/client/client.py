@@ -1,4 +1,5 @@
 import re
+import time
 from urllib.parse import urljoin, quote_plus
 
 import requests
@@ -8,9 +9,19 @@ from ..utils import get_random_ua
 SKEB_WEBISTE = 'https://skeb.jp'
 
 
-class SkebClient:
+class SkebRateLimitError(requests.HTTPError):
+    """Skeb answered 429 and the ``request_key`` challenge did not help; the caller must back off."""
 
-    def __init__(self):
+
+class SkebClient:
+    """Thin client of the skeb.jp JSON API.
+
+    Requests are issued one at a time and ``min_interval`` seconds apart. A 429 is answered at most
+    twice with the ``request_key`` cookie challenge the site hands out; if that does not clear it,
+    ``SkebRateLimitError`` is raised instead of retrying, so a caller can never hammer the site.
+    """
+
+    def __init__(self, min_interval: float = 0.0):
         self._session = requests.session()
         self._session.headers.update({
             'Referer': 'https://skeb.jp',
@@ -18,22 +29,34 @@ class SkebClient:
             "Authorization": "Bearer null",
             "Accept": "application/json, text/plain, */*",
         })
+        self.min_interval = min_interval
+        self.request_count = 0
+        self._last_request = 0.0
+
+    def _pace(self):
+        wait = self._last_request + self.min_interval - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        self._last_request = time.time()
 
     def _get(self, url, params=None):
-        while True:
+        for attempt in range(3):
+            self._pace()
+            self.request_count += 1
             resp = self._session.get(urljoin(SKEB_WEBISTE, url), params=params or {})
-            if not resp.ok and resp.status_code == 429:
-                if 'request_key' in resp.cookies:
-                    continue
-                cookies = re.findall(r'document.cookie\s*=\s*"request_key=(?P<content>[^;]+);', resp.text)
-                if cookies:
-                    self._session.cookies.update({
-                        'request_key': cookies[0]
-                    })
-                    continue
+            if resp.status_code != 429:
+                resp.raise_for_status()
+                return resp.json()
 
-            resp.raise_for_status()
-            return resp.json()
+            if attempt < 2 and 'request_key' in resp.cookies:
+                continue
+            cookies = re.findall(r'document.cookie\s*=\s*"request_key=(?P<content>[^;]+);', resp.text)
+            if attempt < 2 and cookies:
+                self._session.cookies.update({'request_key': cookies[0]})
+                continue
+            break
+
+        raise SkebRateLimitError(f'429 Too Many Requests for url: {resp.url}', response=resp)
 
     def get_page(self, offset: int = 0, limit: int = 90):
         return self._get(

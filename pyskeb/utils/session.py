@@ -1,5 +1,6 @@
 import logging
 import random
+import re
 import time
 from functools import lru_cache
 from typing import Optional, Dict, List, Union
@@ -145,8 +146,23 @@ def _ua_pool():
     return user_agent_rotator
 
 
+_FALLBACK_UA = ('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/129.0.0.0 Safari/537.36')
+_MIN_BROWSER_VERSION = 110
+
+
+def _is_recent_ua(user_agent: str) -> bool:
+    """The pool contains very old browsers (Firefox 8, MSIE) which some sites reject outright."""
+    versions = [int(item) for item in re.findall(r'(?:Chrome|Firefox|Edg|Edge)/(\d+)', user_agent)]
+    return bool(versions) and min(versions) >= _MIN_BROWSER_VERSION
+
+
 def get_random_ua():
-    return _ua_pool().get_random_user_agent()
+    for _ in range(100):
+        user_agent = _ua_pool().get_random_user_agent()
+        if _is_recent_ua(user_agent):
+            return user_agent
+    return _FALLBACK_UA
 
 
 @lru_cache()
