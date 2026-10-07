@@ -80,11 +80,16 @@ def download(fx: Fetcher, url: str, out_dir: str):
     kind, ident = parse(url)
     if kind == 'direct':
         direct = f'https://i.imgur.com/{os.path.basename(urlsplit(url).path)}'
-        try:
-            fetch_file(fx, direct, out_dir, safe_name(os.path.basename(direct)), gone_if_redirected_to=('removed',))
-        except UnexpectedResponse as err:
-            raise ResourceTransient(str(err)) from err
-        return
+        if os.path.splitext(direct)[1]:
+            try:
+                fetch_file(fx, direct, out_dir, safe_name(os.path.basename(direct)), gone_if_redirected_to=('removed',))
+                return
+            except UnexpectedResponse as err:
+                if err.status != 200:
+                    raise ResourceTransient(str(err)) from err
+                # a 200 html page: imgur wraps the image, the media API knows the real file
+        # i.imgur.com/<id> without an extension is an html wrapper page too
+        kind = 'media'
     body = _api(fx, {'album': f'albums/{ident}', 'post': f'posts/{ident}', 'media': f'media/{ident}'}[kind])
     if body is None:
         raise ResourceGone(f'imgur {kind} {ident} not found')
