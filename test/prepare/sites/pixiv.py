@@ -1,5 +1,5 @@
 import re
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from urllib.parse import urlsplit, parse_qs
 
 from .common import host_of, fetch_file
@@ -29,25 +29,27 @@ def match(url: str) -> Optional[str]:
     return f'pixiv_{illust}' if illust else None
 
 
-def _ajax(fx: Fetcher, path: str) -> dict:
+def _ajax(fx: Fetcher, path: str) -> Tuple[int, dict]:
+    """Return ``(status, json)``; 404 is an answer here, because R-18 works answer ``/pages`` with 404 when logged out."""
     resp = fx.get(f'https://www.pixiv.net/ajax/illust/{path}', headers=_REFERER)
-    if resp.status_code in (404, 410):
-        raise ResourceGone(f'pixiv {path} not found')
-    if resp.status_code != 200:
+    if resp.status_code not in (200, 404, 410):
         raise ResourceTransient(f'pixiv {path} -> HTTP {resp.status_code}')
-    return resp.json()
+    try:
+        return resp.status_code, resp.json()
+    except ValueError as err:
+        raise ResourceTransient(f'pixiv {path} did not answer with json') from err
 
 
 def _original_urls(fx: Fetcher, illust: str) -> List[str]:
-    pages = _ajax(fx, f'{illust}/pages')
-    if not pages.get('error'):
+    status, pages = _ajax(fx, f'{illust}/pages')
+    if status == 200 and not pages.get('error'):
         urls = [(item.get('urls') or {}).get('original') for item in pages.get('body') or []]
         urls = [item for item in urls if item]
         if urls:
             return urls[:_MAX_PAGES]
 
-    info = _ajax(fx, illust)
-    if info.get('error'):
+    status, info = _ajax(fx, illust)
+    if status != 200 or info.get('error'):
         raise ResourceGone(f'pixiv illust {illust} is gone: {info.get("message")!r}')
     # Logged-out requests get no original URLs for R-18 works. The thumbnail still carries the upload
     # timestamp path, and i.pximg.net only checks the Referer, so rebuild the original URL from it.
