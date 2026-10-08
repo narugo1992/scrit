@@ -61,11 +61,12 @@ def newest(budget_minutes, poll_seconds, bootstrap, max_skeb_requests, skeb_inte
               help='Maximum number of packs to create in this run; stops early when nothing is left.')
 def pack(rounds):
     logging.try_init_root(logging.INFO)
-    from .repack import repack_all
+    from .repack import repack_all, refresh_statistics
     for index in range(rounds):
         if not repack_all():
             break
         logging.info(f'Pack round {index + 1}/{rounds} done.')
+    refresh_statistics()
 
 
 @cli.command('artists', context_settings={**GLOBAL_CONTEXT_SETTINGS})

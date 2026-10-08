@@ -280,3 +280,22 @@ def repack_all() -> bool:
             fns, archived_resource_ids,
             message=f'[pack] {package_name} | {len(fns)} res merged, {pretty_size(size)}',
         )
+
+
+def refresh_statistics() -> Optional[str]:
+    """Update the overview and index pages of the dataset for the packs that are new.
+
+    Runs after the repack rounds. A failure here is logged and does not fail the repack: the packs are already
+    published and the pages are rebuilt by the next run.
+    """
+    import requests
+    from .yearbook import refresh
+    try:
+        with TemporaryDirectory() as td:
+            message = refresh(hf_client, _REPOSITORY, hf_token, td)
+    except (HfHubHTTPError, requests.RequestException, OSError, ValueError, RuntimeError):
+        logging.exception('Statistics pages were not updated.')
+        return None
+    if message:
+        logging.info(message)
+    return message

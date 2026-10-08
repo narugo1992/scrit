@@ -264,6 +264,7 @@ make unittest COV_TYPES="xml term-missing" # with coverage
 
 - `pyskeb/client/client.py` — `SkebClient` (also reused inside `test/prepare/`): `get_page()`, `get_post()`, `iter_user_pages()`, `iter_work_pages()`; paced by `min_interval`, raises `SkebRateLimitError` instead of retrying a 429
 - `test/prepare_tests/` — offline unit tests for the flow (`venv/bin/python -m pytest test/prepare_tests -q`); check the pytest exit code itself when chaining commands
+- `test/prepare/yearbook.py` — dataset statistics: `refresh()` (called once after the `pack` rounds through `refresh_statistics()`) reads only the zip central directories of the NEW packs with HTTP range requests, updates `stats/packs.json`, and publishes ONE commit with `README.md`, the quarter pages `index/<YYYYQn>.md`, the charts `stats/*.png`, touching nothing else; pack time is the repack time in the name (UTC, shown as UTC+8)
 - `test/prepare/base.py` — HuggingFace client/filesystem init, repo creation with LFS, `number_to_tag()` (size buckets), `make_index_file()` (tar index with hashes)
 - `pyskeb/utils/session.py` — `get_requests_session()`, `srequest()` (exponential backoff)
 

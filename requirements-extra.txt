@@ -23,3 +23,4 @@ cryptography
 pyyaml>=6
 python-magic
 google-re2<1.1.20250722
+matplotlib
