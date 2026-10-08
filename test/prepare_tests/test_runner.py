@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 from typing import Dict, List
 
@@ -759,6 +760,7 @@ class TestLeaseOfAFinishedRun:
         assert ci.github_run_status('local') is None  # not a numeric run id
 
 
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='SIGALRM and forced exit are Linux only')
 @pytest.mark.unittest
 class TestEndingSafely:
     def test_the_hard_deadline_ends_the_run_with_code_5(self):

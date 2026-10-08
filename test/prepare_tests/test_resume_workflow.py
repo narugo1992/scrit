@@ -4,8 +4,13 @@ import os
 import stat
 import subprocess
 
+import sys
+
 import pytest
 import yaml
+
+# The newest crawler only runs on Linux; these tests drive its bash workflow or POSIX signals.
+NEEDS_LINUX = pytest.mark.skipif(not sys.platform.startswith('linux'), reason='crawler runs on Linux only')
 
 WORKFLOW = os.path.join(os.path.dirname(__file__), '..', '..', '.github', 'workflows', 'newest_resume.yml')
 
@@ -66,6 +71,7 @@ def stale_entry(lasted=19800):
     return entry(500, status='in_progress', conclusion=None, lasted=lasted)
 
 
+@NEEDS_LINUX
 @pytest.mark.unittest
 class TestResumeAfterAnEvent:
     def test_a_finished_run_that_the_stale_list_still_shows_as_going_does_not_block_the_restart(self, tmp_path):
@@ -111,6 +117,7 @@ class TestResumeAfterAnEvent:
         assert 'DISPATCHED' not in out and 'debugging run' in out
 
 
+@NEEDS_LINUX
 @pytest.mark.unittest
 class TestResumeFromTheCron:
     def test_nothing_is_started_while_a_run_is_going(self, tmp_path):

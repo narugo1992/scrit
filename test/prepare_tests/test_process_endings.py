@@ -7,6 +7,9 @@ import time
 
 import pytest
 
+# The newest crawler only runs on Linux; these tests drive its bash workflow or POSIX signals.
+NEEDS_LINUX = pytest.mark.skipif(not sys.platform.startswith('linux'), reason='crawler runs on Linux only')
+
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 
 CHILD = textwrap.dedent('''
@@ -48,6 +51,7 @@ def wait_ready(proc):
     raise AssertionError('the child never got ready')
 
 
+@NEEDS_LINUX
 @pytest.mark.unittest
 class TestRealProcessEndings:
     def test_sigterm_ends_the_process_and_releases_the_lease(self, tmp_path):
