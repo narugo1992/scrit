@@ -86,18 +86,21 @@ class TestTimes:
 class TestPages:
     def test_file_names_link_to_the_file_page_not_the_download(self):
         stats = yb.aggregate([yb.summarize_pack('pack_20240501_125415_430239.zip', 1, [('a_1_x.png', 3)])])
-        page = yb.render_quarter('2024Q2', {'2024-05': [('a_1_x.png', 'image', 3, 'pack_20240501_125415_430239.zip')]},
-                                 stats)
+        record = yb.summarize_pack('pack_20240501_125415_430239.zip', 1, [('a_1_x.png', 3)])
+        page = yb.render_quarter('2024Q2', {'2024-05': [record]}, stats)
         assert '[p20240501125415]: https://hub.deepghs.org/datasets/hk1901/fuck_the_skeb/blob/main/packs/pack_20240501_125415_430239.zip' in page
         assert '/resolve/' not in page
-        assert '[a_1_x.png][p20240501125415]' in page
+        assert '[pack_20240501_125415_430239.zip][p20240501125415]' in page
+        assert page.count('| [') == 1  # one row per zip, not per file
+        assert '| [pack_20240501_125415_430239.zip][p20240501125415] (05-01 20:54) | 1 B | 3 B | 1 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |' in page
 
     def test_pipes_and_brackets_in_file_names_are_escaped(self):
         assert yb._cell('a|b[c]') == 'a\\|b\\[c\\]'
 
     def test_readme_points_to_quarter_pages_and_charts(self, tmp_path):
-        records = [yb.summarize_pack('pack_20240501_125415_430239.zip', 1, [('a_1_x.png', 3), ('a_1_y.psd', 9)])]
-        written = yb.build(records, lambda record: [('a_1_x.png', 3), ('a_1_y.psd', 9)], str(tmp_path))
+        pack = 'pack_20240501_125415_430239.zip'
+        records = [yb.summarize_pack(pack, 1, [('a_1_x.png', 3), ('a_1_y.psd', 9)])]
+        written = yb.render_pages(records, str(tmp_path), ['2024Q2'])
         readme = (tmp_path / 'README.md').read_text(encoding='utf-8')
         assert 'index/2024Q2.md' in readme and './stats/quarters.png' in readme
         assert {'README.md', 'index/2024Q2.md', 'stats/quarters.png', 'stats/months_12.png',
@@ -107,7 +110,7 @@ class TestPages:
     def test_only_the_asked_quarters_are_rendered(self, tmp_path):
         records = [yb.summarize_pack('pack_20240501_125415_430239.zip', 1, [('a.png', 1)]),
                    yb.summarize_pack('pack_20250101_125415_430239.zip', 1, [('b.png', 1)])]
-        written = yb.build(records, lambda record: [('x.png', 1)], str(tmp_path), quarters=['2025Q1'])
+        written = yb.render_pages(records, str(tmp_path), ['2025Q1'])
         assert 'index/2025Q1.md' in written and 'index/2024Q2.md' not in written
 
     def test_quarter_tables_carry_the_size_of_each_category(self, tmp_path):
@@ -116,3 +119,33 @@ class TestPages:
         page = yb.render_quarter('2024Q2', {}, stats)
         assert '| layered | 1 | 50.0% | 700 B | 70.0% |' in page
         assert '| image | 1 | 50.0% | 300 B | 30.0% |' in page
+
+
+@pytest.mark.unittest
+class TestManifest:
+    def test_a_new_pack_changes_only_its_quarter_and_the_overview(self):
+        known = [yb.summarize_pack('pack_20240501_125415_430239.zip', 1, [('a_1_x.png', 3)])]
+        new = yb.summarize_pack('pack_20250101_125415_430239.zip', 1, [('b_2_y.psd', 7)])
+        files = yb.plan_update(known, [new])
+        assert set(files) == {'README.md', 'index/2025Q1.md', 'stats/quarters.png', 'stats/months_12.png',
+                              'stats/days_30.png', 'stats/categories.png', yb.MANIFEST_PATH}
+        assert 'index/2024Q2.md' not in files
+        manifest = json.loads(files[yb.MANIFEST_PATH].decode('utf-8'))
+        assert [r['name'] for r in manifest] == ['pack_20240501_125415_430239.zip', 'pack_20250101_125415_430239.zip']
+
+    def test_members_of_a_local_zip_are_listed_without_directories(self, tmp_path):
+        path = tmp_path / 'pack.zip'
+        path.write_bytes(make_zip([('a/', b''), ('a/one.png', b'123'), ('two.mp4', b'12345')]))
+        assert sorted(yb.zip_members_local(str(path))) == [('a/one.png', 3), ('two.mp4', 5)]
+
+
+@pytest.mark.unittest
+class TestOrder:
+    def test_packs_and_months_run_newest_first(self):
+        older = yb.summarize_pack('pack_20240501_100000_000001.zip', 1, [('a.png', 1)])
+        newer = yb.summarize_pack('pack_20240520_100000_000001.zip', 1, [('b.png', 1)])
+        earlier_month = yb.summarize_pack('pack_20240401_100000_000001.zip', 1, [('c.png', 1)])
+        stats = yb.aggregate([older, newer, earlier_month])
+        page = yb.render_quarter('2024Q2', {'2024-05': [older, newer], '2024-04': [earlier_month]}, stats)
+        assert page.index('pack_20240520') < page.index('pack_20240501')  # newer pack above the older one
+        assert page.index('## 2024-05') < page.index('## 2024-04')  # newer month above the older one

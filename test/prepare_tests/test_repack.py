@@ -32,6 +32,8 @@ def fake(monkeypatch):
     monkeypatch.setattr(repack, '_load_archived_ids', lambda: ['old_1'])
     monkeypatch.setattr(repack, '_make_records', lambda: [{'filename': 'pack_1.zip', 'size': 5}])
     monkeypatch.setattr(repack.time, 'sleep', lambda s: None)
+    # the statistics are checked in test_yearbook; here they are not built against a fake repository
+    monkeypatch.setattr(repack, '_statistics_operations', lambda *args: [])
     return client
 
 
@@ -77,3 +79,12 @@ def test_pack_commit_titles_say_what_went_in_and_how_big(fake, monkeypatch):
     assert repack.promote_oversized() is True
     message = fake.commits[0][0]
     assert message.startswith('[pack] pack_') and '1 oversized res, 9.0 GiB, copied as is | big_one' in message
+
+
+def test_statistics_failure_does_not_stop_the_pack(monkeypatch):
+    from test.prepare import yearbook
+
+    def broken_read():
+        raise RuntimeError('range read failed')
+    monkeypatch.setattr(yearbook, 'load_manifest', lambda *args: [])
+    assert repack._statistics_operations('pack_20240501_125415_430239.zip', 10, broken_read) == []

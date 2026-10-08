@@ -6,7 +6,7 @@ import time
 import zipfile
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Optional
+from typing import Callable, Optional
 
 import pandas as pd
 from hbutils.scale import size_to_bytes_str
@@ -152,13 +152,14 @@ def _load_archived_ids():
             return json.load(f)
 
 
-def _publish_pack(package_name, package_size, pack_operation, fns, archived_resource_ids, message=None) -> bool:
+def _publish_pack(package_name, package_size, pack_operation, fns, archived_resource_ids, message=None,
+                  statistics=()) -> bool:
     """Register a new pack: delete its sources from ``unarchived/`` and refresh README, index and archived ids.
 
     Everything goes into one commit. ``pack_operation`` adds the pack file, either by uploading a zip that was
     built locally or by copying an existing one on the server.
     """
-    operations = [pack_operation]
+    operations = [pack_operation, *statistics]
     for fn in fns:
         operations.append(CommitOperationDelete(
             path_in_repo=f'unarchived/{fn}',
@@ -231,6 +232,24 @@ def _publish_pack(package_name, package_size, pack_operation, fns, archived_reso
                 return True
 
 
+def _statistics_operations(package_name: str, package_size: int, read_members: Callable[[], list]) -> list:
+    """Commit operations that add a new pack to the dataset statistics, so they land with the pack itself.
+
+    Returns no operations when they cannot be built right now: the pack is still published, and the catch-up run
+    after the rounds adds it to the statistics later.
+    """
+    import requests
+    from .yearbook import load_manifest, operations_for, plan_update, summarize_pack
+    try:
+        known = load_manifest(hf_client, _REPOSITORY, hf_token)
+        record = summarize_pack(package_name, package_size, read_members())
+        files = plan_update(known, [record])
+    except (HfHubHTTPError, requests.RequestException, OSError, ValueError, RuntimeError):
+        logging.exception(f'Statistics for {package_name!r} were not built, the catch-up run adds them later.')
+        return []
+    return operations_for(files)
+
+
 def promote_oversized() -> bool:
     """Turn one zip that is too big to share a pack into a pack of its own, by a server side copy.
 
@@ -251,11 +270,15 @@ def promote_oversized() -> bool:
     filename = os.path.basename(item.path)
     package_name = f'pack_{_timestamp()}.zip'
     logging.info(f'{filename!r} is {item.size / 1024 ** 3:.2f} GiB, publishing it as pack {package_name!r} by copy ...')
+    from .yearbook import read_members_remote
+    url = hf_hub_url(repo_id=_REPOSITORY, repo_type='dataset', filename=f'unarchived/{filename}')
     return _publish_pack(
         package_name, item.size,
         CommitOperationCopy(src_path_in_repo=f'unarchived/{filename}', path_in_repo=f'packs/{package_name}'),
         [filename], _load_archived_ids(),
         message=f'[pack] {package_name} | 1 oversized res, {pretty_size(item.size)}, copied as is | {os.path.splitext(filename)[0]}',
+        statistics=_statistics_operations(package_name, item.size,
+                                          lambda: read_members_remote(url, hf_token, item.size)),
     )
 
 
@@ -274,11 +297,13 @@ def repack_all() -> bool:
         package_name = f'pack_{_timestamp()}.zip'
         logging.info(f'Creating new pack {package_name!r} ...')
         size = os.path.getsize(zip_file)
+        from .yearbook import zip_members_local
         return _publish_pack(
             package_name, size,
             CommitOperationAdd(path_or_fileobj=zip_file, path_in_repo=f'packs/{package_name}'),
             fns, archived_resource_ids,
             message=f'[pack] {package_name} | {len(fns)} res merged, {pretty_size(size)}',
+            statistics=_statistics_operations(package_name, size, lambda: zip_members_local(zip_file)),
         )
 
 
@@ -291,8 +316,7 @@ def refresh_statistics() -> Optional[str]:
     import requests
     from .yearbook import refresh
     try:
-        with TemporaryDirectory() as td:
-            message = refresh(hf_client, _REPOSITORY, hf_token, td)
+        message = refresh(hf_client, _REPOSITORY, hf_token)
     except (HfHubHTTPError, requests.RequestException, OSError, ValueError, RuntimeError):
         logging.exception('Statistics pages were not updated.')
         return None

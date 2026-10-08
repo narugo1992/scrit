@@ -11,6 +11,8 @@ import json
 import os
 import re
 import struct
+import tempfile
+import zipfile
 from collections import Counter, defaultdict
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -254,13 +256,13 @@ def render_charts(stats: Dict, directory: str) -> Dict[str, str]:
 
 
 # ---------------------------------------------------------------- pages
-def render_quarter(quarter: str, rows_by_month: Dict[str, List[Tuple[str, str, int, str]]],
-                   stats: Dict) -> str:
-    """The index page of one quarter. ``rows_by_month`` maps ``YYYY-MM`` to ``(file, category, bytes, pack)``."""
+def render_quarter(quarter: str, packs_by_month: Dict[str, List[Dict]], stats: Dict) -> str:
+    """The index page of one quarter: one row per zip pack, grouped by month."""
     q = stats['quarters'].get(quarter, {'packs': 0, 'files': 0, 'bytes': 0, 'categories': Counter(),
                                         'category_bytes': Counter()})
     out = [f'# Index {quarter}', '',
-           f'Every file of the packs whose repack time falls in {quarter} (UTC+8). Back to the [overview]({REPO_URL}/blob/main/README.md).', '',
+           f'Every pack whose repack time falls in {quarter} (UTC+8). One row per zip; the name links to the file page '
+           f'of the pack. Back to the [overview]({REPO_URL}/blob/main/README.md).', '',
            f'**{q["files"]:,} files**, {human_bytes(q["bytes"])}, in {q["packs"]} packs.', '',
            '## Summary by category', '',
            _table(['Category', 'Files', 'Share', 'Size', 'Share'],
@@ -280,11 +282,16 @@ def render_quarter(quarter: str, rows_by_month: Dict[str, List[Tuple[str, str, i
     out += [_table(['Day', 'Packs', 'Files', 'Size'], day_rows or [['-', '0', '0', '-']]), '']
 
     refs = []
-    for month in sorted(rows_by_month):
-        out += [f'## {month}', '', '| File | Category | Size | Pack |', '|---|---|---|---|']
-        for file_name, cat, nbytes, pack in rows_by_month[month]:
-            refs.append(pack)
-            out.append(f'| [{_cell(file_name)}][{pack_ref(pack)}] | {cat} | {human_bytes(nbytes)} | [{pack}][{pack_ref(pack)}] |')
+    for month in sorted(packs_by_month, reverse=True):  # newest month first
+        headers = ['Pack (repack time)', 'Zip size', 'Content', 'Files'] + CATEGORY_ORDER
+        out += [f'## {month}', '', '| ' + ' | '.join(headers) + ' |', '|' + '|'.join('---' for _ in headers) + '|']
+        for record in sorted(packs_by_month[month], key=lambda r: r['time'], reverse=True):  # newest pack first
+            refs.append(record['name'])
+            stamp = dt.datetime.fromisoformat(record['time']).strftime('%m-%d %H:%M')
+            counts = [str(record['categories'].get(cat, [0, 0])[0]) for cat in CATEGORY_ORDER]
+            out.append('| ' + ' | '.join([f'[{record["name"]}][{pack_ref(record["name"])}] ({stamp})',
+                                         human_bytes(record['size']), human_bytes(record['bytes']),
+                                         f'{record["files"]:,}', *counts]) + ' |')
         out.append('')
     for pack in dict.fromkeys(refs):
         out.append(f'[{pack_ref(pack)}]: {pack_url(pack)}')
@@ -351,35 +358,31 @@ def render_readme(stats: Dict, quarters_written: List[str], charts: Dict[str, st
     return '\n'.join(out)
 
 
+# ---------------------------------------------------------------- data files
+MANIFEST_PATH = 'stats/packs.json'  # one summary record per pack; every page is rendered from it
+
+
+def zip_members_local(path: str) -> List[Tuple[str, int]]:
+    """The members of a zip that is on the local disk (the pack that was just built)."""
+    with zipfile.ZipFile(path) as zf:
+        return [(info.filename, info.file_size) for info in zf.infolist() if not info.filename.endswith('/')]
+
+
 # ---------------------------------------------------------------- building
-MANIFEST_PATH = 'stats/packs.json'
-
-
-def build(records: List[Dict], read_members: Callable[[Dict], List[Tuple[str, int]]], out_dir: str,
-          quarters: Optional[List[str]] = None) -> List[str]:
-    """Write README.md, the quarter pages and the charts into ``out_dir``. Returns the relative paths written.
-
-    ``read_members`` gives the file list of a pack record. Only the quarters in ``quarters`` (default: all) are
-    re-read and rendered; the overview and the charts always cover every pack.
-    """
+def render_pages(records: List[Dict], out_dir: str, quarters: List[str]) -> List[str]:
+    """Write the index pages for ``quarters``, the charts, README.md and the manifest into ``out_dir``."""
     stats = aggregate(records)
-    wanted = set(quarters) if quarters is not None else set(stats['quarters'])
     written = []
-    index_dir = os.path.join(out_dir, 'index')
-    os.makedirs(index_dir, exist_ok=True)
-    per_quarter: Dict[str, Dict[str, List[Tuple[str, str, int, str]]]] = defaultdict(lambda: defaultdict(list))
-    for record in stats['dated']:
-        stamp = dt.datetime.fromisoformat(record['time'])
-        quarter = _quarter_key(stamp)
-        if quarter not in wanted:
-            continue
-        month = stamp.strftime('%Y-%m')
-        for file_name, nbytes in read_members(record):
-            per_quarter[quarter][month].append((file_name, category_of(file_name), nbytes, record['name']))
-    for quarter in sorted(wanted & set(stats['quarters'])):
+    os.makedirs(os.path.join(out_dir, 'index'), exist_ok=True)
+    for quarter in sorted(set(quarters) & set(stats['quarters'])):
+        packs_by_month: Dict[str, List[Dict]] = defaultdict(list)
+        for record in stats['dated']:
+            stamp = dt.datetime.fromisoformat(record['time'])
+            if _quarter_key(stamp) == quarter:
+                packs_by_month[stamp.strftime('%Y-%m')].append(record)
         rel = f'index/{quarter}.md'
         with open(os.path.join(out_dir, rel), 'w', encoding='utf-8') as f:
-            f.write(render_quarter(quarter, per_quarter.get(quarter, {}), stats))
+            f.write(render_quarter(quarter, packs_by_month, stats))
         written.append(rel)
     charts = render_charts(stats, os.path.join(out_dir, 'stats'))
     written += [f'stats/{name}' for name in charts.values()]
@@ -390,6 +393,18 @@ def build(records: List[Dict], read_members: Callable[[Dict], List[Tuple[str, in
         json.dump(records, f, ensure_ascii=False, indent=1)
     written.append(MANIFEST_PATH)
     return written
+
+
+def plan_update(known: List[Dict], new_records: List[Dict]) -> Dict[str, bytes]:
+    """The files that change when ``new_records`` are added: only the pages of the quarters that got packs."""
+    records = known + new_records
+    touched = sorted({quarter_of_pack(record['name']) for record in new_records} - {None})
+    files: Dict[str, bytes] = {}
+    with tempfile.TemporaryDirectory() as td:
+        for rel in render_pages(records, td, touched):
+            with open(os.path.join(td, rel), 'rb') as f:
+                files[rel] = f.read()
+    return files
 
 
 def quarter_of_pack(name: str) -> Optional[str]:
@@ -412,49 +427,40 @@ def range_reader(url: str, token: Optional[str]) -> GetRange:
     return get
 
 
-def refresh(api, repo_id: str, token: Optional[str], staging: str) -> Optional[str]:
-    """Bring the statistics pages up to date with the packs in the repository and publish them in one commit.
+def load_manifest(api, repo_id: str, token: Optional[str]) -> List[Dict]:
+    """The pack records the statistics were built from (empty before the first build)."""
+    from huggingface_hub import hf_hub_download
+    if not api.file_exists(repo_id=repo_id, repo_type='dataset', filename=MANIFEST_PATH):
+        return []
+    with open(hf_hub_download(repo_id=repo_id, repo_type='dataset', filename=MANIFEST_PATH, token=token),
+              encoding='utf-8') as f:
+        return json.load(f)
 
-    Only the pages change: ``README.md``, the index pages of the quarters that got new packs, the charts and the
-    manifest ``stats/packs.json``. Packs and every other file are left alone. Returns the commit message, or None
-    when nothing was new.
-    """
-    from huggingface_hub import CommitOperationAdd, hf_hub_download, hf_hub_url
 
-    records: List[Dict] = []
-    if api.file_exists(repo_id=repo_id, repo_type='dataset', filename=MANIFEST_PATH):
-        with open(hf_hub_download(repo_id=repo_id, repo_type='dataset', filename=MANIFEST_PATH,
-                                  token=token), encoding='utf-8') as f:
-            records = json.load(f)
-    known = {record['name'] for record in records}
+def operations_for(files: Dict[str, bytes]):
+    from huggingface_hub import CommitOperationAdd
+    return [CommitOperationAdd(path_in_repo=path, path_or_fileobj=data) for path, data in sorted(files.items())]
+
+
+def refresh(api, repo_id: str, token: Optional[str]) -> Optional[str]:
+    """Catch-up: add every pack the statistics do not know yet, in one commit. None when nothing was new."""
+    from huggingface_hub import hf_hub_url
+
+    known = load_manifest(api, repo_id, token)
+    names = {record['name'] for record in known}
     packs = [item for item in api.list_repo_tree(repo_id=repo_id, repo_type='dataset', path_in_repo='packs')
-             if item.path.endswith('.zip')]
-    fresh = [item for item in packs if os.path.basename(item.path) not in known]
-    if not fresh:
+             if item.path.endswith('.zip') and os.path.basename(item.path) not in names]
+    if not packs:
         return None
-    url_of = {}
+    new_records = []
     for item in packs:
-        url_of[os.path.basename(item.path)] = (hf_hub_url(repo_id=repo_id, repo_type='dataset', filename=item.path),
-                                               item.size)
-    for item in fresh:
-        name = os.path.basename(item.path)
-        url, size = url_of[name]
-        members = read_members_remote(url, token, size)
-        records.append(summarize_pack(name, size, members))
-    touched = sorted({quarter_of_pack(r['name']) for r in records if r['name'] in
-                      {os.path.basename(i.path) for i in fresh}} - {None})
-
-    def members_of(record: Dict) -> List[Tuple[str, int]]:
-        url, size = url_of[record['name']]
-        return read_members_remote(url, token, size)
-
-    written = build(records, members_of, staging, quarters=touched)
-    operations = [CommitOperationAdd(path_in_repo=rel, path_or_fileobj=os.path.join(staging, rel))
-                  for rel in written]
-    names = ', '.join(sorted(os.path.basename(i.path) for i in fresh))
-    message = f'[stats] {len(fresh)} new pack(s), quarters {", ".join(touched)} | overview and index pages'
-    api.create_commit(repo_id=repo_id, repo_type='dataset', operations=operations, commit_message=message,
-                      commit_description=f'New packs: {names}')
+        url = hf_hub_url(repo_id=repo_id, repo_type='dataset', filename=item.path)
+        members = read_members_remote(url, token, item.size)
+        new_records.append(summarize_pack(os.path.basename(item.path), item.size, members))
+    message = f'[stats] catch-up for {len(packs)} pack(s) | overview and index pages'
+    api.create_commit(repo_id=repo_id, repo_type='dataset', operations=operations_for(plan_update(known, new_records)),
+                      commit_message=message,
+                      commit_description='Packs: ' + ', '.join(sorted(os.path.basename(i.path) for i in packs)))
     return message
 
 
