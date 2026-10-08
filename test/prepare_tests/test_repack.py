@@ -52,7 +52,7 @@ class TestPromotion:
         assert copy.src_path_in_repo == 'unarchived/huge.zip' and copy.path_in_repo.startswith('packs/pack_')
         assert [op.path_in_repo for op in operations if isinstance(op, CommitOperationDelete)] == ['unarchived/huge.zip']
         paths = {op.path_in_repo for op in operations if isinstance(op, CommitOperationAdd)}
-        assert paths == {'README.md', 'index.json', 'archived.json'}
+        assert paths == {'index.json', 'archived.json'}  # the README comes from the statistics, not from here
 
     def test_nothing_to_do_without_oversized_zips(self, fake, monkeypatch):
         listing(monkeypatch, {'small': 1 * GB, 'other': 5 * GB})
@@ -88,3 +88,19 @@ def test_statistics_failure_does_not_stop_the_pack(monkeypatch):
         raise RuntimeError('range read failed')
     monkeypatch.setattr(yearbook, 'load_manifest', lambda *args: [])
     assert repack._statistics_operations('pack_20240501_125415_430239.zip', 10, broken_read) == []
+
+
+def test_a_pack_commit_never_writes_the_dataset_readme(fake, monkeypatch, tmp_path):
+    """The README and the index pages come from the statistics; a second README in the same commit replaced them."""
+    from huggingface_hub import CommitOperationAdd
+    zip_path = tmp_path / 'pack_20241101_000000_000001.zip'
+    zip_path.write_bytes(b'x')
+    captured = []
+    monkeypatch.setattr(repack, '_statistics_operations',
+                        lambda name, size, members: [CommitOperationAdd(path_in_repo='README.md', path_or_fileobj=b'stats')])
+    monkeypatch.setattr(fake, 'create_commit', lambda **kwargs: captured.append(kwargs['operations']) or None, raising=False)
+    repack._publish_pack('pack_20241101_000000_000001.zip', 1,
+                         CommitOperationAdd(path_in_repo='packs/pack_20241101_000000_000001.zip', path_or_fileobj=b'x'),
+                         [], [], message='[pack] test', statistics=repack._statistics_operations('x', 1, lambda: []))
+    paths = [op.path_in_repo for op in captured[0]]
+    assert paths.count('README.md') == 1 and 'index.json' in paths and 'archived.json' in paths

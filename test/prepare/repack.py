@@ -8,8 +8,6 @@ from contextlib import contextmanager
 from datetime import datetime
 from typing import Callable, Optional
 
-import pandas as pd
-from hbutils.scale import size_to_bytes_str
 from hbutils.system import TemporaryDirectory
 from huggingface_hub import CommitOperationAdd, CommitOperationCopy, CommitOperationDelete
 from huggingface_hub import hf_hub_url, hf_hub_download
@@ -154,10 +152,11 @@ def _load_archived_ids():
 
 def _publish_pack(package_name, package_size, pack_operation, fns, archived_resource_ids, message=None,
                   statistics=()) -> bool:
-    """Register a new pack: delete its sources from ``unarchived/`` and refresh README, index and archived ids.
+    """Register a new pack: delete its sources from ``unarchived/``, refresh index.json and the archived ids.
 
-    Everything goes into one commit. ``pack_operation`` adds the pack file, either by uploading a zip that was
-    built locally or by copying an existing one on the server.
+    Everything goes into one commit, with the statistics operations of the pack. The dataset README and the index
+    pages belong to the statistics (see ``yearbook``), so they are not written here: a README written in this commit
+    would clash with the statistics README of the same commit.
     """
     operations = [pack_operation, *statistics]
     for fn in fns:
@@ -170,34 +169,7 @@ def _publish_pack(package_name, package_size, pack_operation, fns, archived_reso
     all_records.append({'filename': package_name, 'size': package_size})
     all_records = sorted(all_records, key=lambda x: x['filename'], reverse=True)
 
-    df_records = []
-    for item in all_records:
-        url_for_download = hf_hub_url(
-            repo_id=_REPOSITORY, repo_type="dataset",
-            filename=f"packs/{item['filename']}"
-        )
-        df_records.append({
-            'Filename': item['filename'],
-            'Size': size_to_bytes_str(item['size'], precision=3),
-            'Link': f'[Download]({url_for_download})'
-        })
-
-    df = pd.DataFrame(df_records)
-
     with TemporaryDirectory() as td:
-        md_file = os.path.join(td, 'README.md')
-        with open(md_file, 'w') as f:
-            print('---', file=f)
-            print('license: other', file=f)
-            print('---', file=f)
-            print('', file=f)
-            print(df.to_markdown(index=False), file=f)
-
-        operations.append(CommitOperationAdd(
-            path_or_fileobj=md_file,
-            path_in_repo='README.md',
-        ))
-
         index_file = os.path.join(td, 'index.json')
         with open(index_file, 'w') as f:
             json.dump(all_records, f, sort_keys=True, ensure_ascii=False, indent=4)
