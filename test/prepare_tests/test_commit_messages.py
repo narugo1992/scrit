@@ -33,13 +33,14 @@ class TestCrawlerCommitMessages:
         posts = {listing[0]: 'https://fake.test/a https://fake.test/b'}
         runner, store, skeb = make(listing, posts)
         store.state['backlog'] = []
-        runner.process_post  # noqa: B018
         store.enqueue(listing)
         runner.process_post(listing[0])
+        runner._close_wave()
         message = titles(store)[-1]
-        assert re.fullmatch(r'\[new\] @u3/works/3 \| \+2 res, \d+ B \(fake 2\) \| 2 posts waiting', message), message
+        assert re.fullmatch(r'\[wave\] \+2 res, \d+ B \(fake 2\) \| new 2 \| 2 posts waiting', message), message
         description = store.client.commits[-1]['description'].splitlines()
-        assert [line.split()[0] for line in description] == ['fake_a', 'fake_b'] and all(re.fullmatch(r'\S+  \d+ B', line) for line in description)
+        assert [line.split()[0] for line in description] == ['fake_a', 'fake_b']
+        assert all(re.fullmatch(r'\S+  \d+ B  new  @u3/works/3', line) for line in description), description
 
     def test_a_failure_is_reported_as_queued_not_as_fetched(self, env):
         site, clock, make = env
@@ -47,7 +48,7 @@ class TestCrawlerCommitMessages:
         site.behaviour = {'https://fake.test/slow': ResourceTransient('net'), 'https://fake.test/dead': ResourceGone('404')}
         runner, store, skeb = make(listing, {listing[0]: 'https://fake.test/slow https://fake.test/dead'})
         runner.cycle()
-        assert titles(store)[0] == '[new] @u1/works/1 | +0 res, 1 gone or empty, 1 queued for retry | 0 posts waiting'
+        assert titles(store)[0] == '[state] queue and cursor updated | 1 gone or empty, 1 queued for retry | 0 posts waiting'
         assert store.client.commits[0]['description'] == ''
 
     def test_a_retry_is_labelled_with_its_attempt_and_the_post_it_came_from(self, env):
@@ -56,8 +57,8 @@ class TestCrawlerCommitMessages:
         store.add_pending({'rid': 'fake_old', 'url': 'https://fake.test/old', 'prefix': 'x_', 'post': '/@x/works/1',
                            'site': 'fake', 'attempts': 2, 'first_seen': 0, 'last_error': '', 'next_try': 0})
         runner.cycle()
-        retry = [m for m in titles(store) if m.startswith('[retry]')]
-        assert len(retry) == 1 and re.fullmatch(r'\[retry\] fake_old \(attempt 3, from @x/works/1\) \| \+1 res, \d+ B \(fake 1\)', retry[0]), retry
+        assert len(titles(store)) == 1 and re.fullmatch(r'\[wave\] \+1 res, \d+ B \(fake 1\) \| retry 1 \| 0 posts waiting', titles(store)[0]), titles(store)
+        assert store.client.commits[0]['description'].endswith('retry  fake_old (attempt 3, from @x/works/1)')
 
     def test_a_linked_older_work_is_marked_old(self, env):
         site, clock, make = env
@@ -65,8 +66,8 @@ class TestCrawlerCommitMessages:
         posts = {'/@a/works/10': 'https://skeb.jp/@b/works/3', '/@b/works/3': 'https://fake.test/linked'}
         runner, store, skeb = make(listing, posts)
         runner.cycle()
-        old = [m for m in titles(store) if m.startswith('[old]')]
-        assert len(old) == 1 and old[0].startswith('[old] @b/works/3 (linked from a post) | +1 res'), old
+        assert re.fullmatch(r'\[wave\] \+1 res, \d+ B \(fake 1\) \| old 1 \| 0 posts waiting', titles(store)[0]), titles(store)
+        assert store.client.commits[0]['description'].endswith('old  @b/works/3 (linked from a post)')
 
     def test_posts_without_resources_are_summarised_in_a_state_commit(self, env):
         site, clock, make = env
@@ -88,4 +89,4 @@ def test_resources_that_are_already_archived_are_said_so(env):
     listing = paths(1)
     runner, store, skeb = make(listing, {listing[0]: 'https://fake.test/seen'}, store=MemStore(archived=['fake_seen']))
     runner.cycle()
-    assert titles(store)[0] == '[new] @u1/works/1 | +0 res, 1 already archived | 0 posts waiting'
+    assert titles(store)[0] == '[state] queue and cursor updated | 1 already archived | 0 posts waiting'

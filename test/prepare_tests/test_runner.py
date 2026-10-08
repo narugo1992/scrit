@@ -136,9 +136,11 @@ class TestRunner:
         assert site.calls == ['https://fake.test/r0', 'https://fake.test/r1', 'https://fake.test/r2']
         assert store.head == listing and store.backlog == []  # newest first, nothing left waiting
         uploaded = [c for c in store.client.commits if any(p.startswith('unarchived/') for p in c['paths'])]
-        assert len(uploaded) == 3
+        assert len(uploaded) == 1  # the three resources went out in one wave
+        assert {p for p in uploaded[0]['paths'] if p.startswith('unarchived/')} == {
+            'unarchived/fake_r0.zip', 'unarchived/fake_r1.zip', 'unarchived/fake_r2.zip'}
         # zips and state travel in the same commit
-        assert all('state/newest.json' in c['paths'] for c in uploaded)
+        assert 'state/newest.json' in uploaded[0]['paths']
 
     def test_only_new_posts_after_the_cursor(self, env):
         site, clock, make = env
@@ -323,10 +325,9 @@ class TestFailureListIsCommittedWithEveryUpload:
     def test_cursor_is_flushed_after_a_quiet_period_even_without_resources(self, env):
         site, clock, make = env
         listing = paths(3)
-        runner, store, skeb = make(listing, {listing[0]: 'no links here'}, flush_every=1000)
-        store.last_commit_at = time.time() - 1000
+        runner, store, skeb = make(listing, {listing[0]: 'no links here'})
         store.enqueue([listing[0]])
-        runner.process_post(listing[0])
+        runner.cycle()  # a round always ends with a commit, so the cursor never waits through the sleep
         assert any('state/newest.json' in c['paths'] for c in store.client.commits)
 
 
@@ -817,7 +818,7 @@ class TestEndingSafely:
         runner.cycle()  # must not raise
         assert store.dirty  # nothing was lost, the state is still waiting to be written
         store.client.fail_commits = 0
-        runner._flush()
+        runner._close_wave()
         assert not store.dirty
 
     def test_a_resource_that_takes_too_long_is_given_up_for_a_retry(self, tmp_path, monkeypatch):
@@ -880,3 +881,62 @@ class TestHistorySeeding:
         runner, store, skeb = make([], {})
         assert runner.seed_from_history() == 0
         assert store.pending == []
+
+
+@pytest.mark.unittest
+class TestWaves:
+    def test_nothing_is_committed_before_the_wave_is_old_enough(self, env):
+        site, clock, make = env
+        listing = paths(2)
+        runner, store, skeb = make(listing, {listing[0]: 'https://fake.test/a', listing[1]: 'https://fake.test/b'})
+        runner.process_post(listing[0])
+        runner.process_post(listing[1])
+        assert store.client.commits == []  # two posts, one open wave
+        assert 'fake_a' in runner._wave.zips and 'fake_a' not in store.done
+        clock.now += 200
+        runner._maybe_close_wave()
+        assert len(store.client.commits) == 1
+        assert {'fake_a', 'fake_b'} <= store.done
+
+    def test_a_full_wave_is_committed_at_once(self, env):
+        site, clock, make = env
+        listing = paths(3)
+        runner, store, skeb = make(listing, {p: f'https://fake.test/r{i}' for i, p in enumerate(listing)},
+                                   wave_resources=2)
+        runner.process_post(listing[0])
+        assert store.client.commits == []
+        runner.process_post(listing[1])
+        assert len(store.client.commits) == 1  # the second resource filled the wave
+        assert runner._wave.zips == {}
+
+    def test_a_resource_linked_from_two_posts_is_fetched_once_per_wave(self, env):
+        site, clock, make = env
+        listing = paths(2)
+        shared = 'https://fake.test/shared'
+        runner, store, skeb = make(listing, {listing[0]: shared, listing[1]: shared})
+        runner.cycle()
+        assert site.calls == [shared]
+        zips = [p for c in store.client.commits for p in c['paths'] if p.startswith('unarchived/')]
+        assert zips == ['unarchived/fake_shared.zip']
+
+    def test_failed_wave_puts_its_jobs_back_in_the_queue_and_removes_the_zips(self, env, monkeypatch):
+        site, clock, make = env
+        monkeypatch.setattr('test.prepare.store.time.sleep', lambda s: None)
+        listing = paths(1)
+        runner, store, skeb = make(listing, {listing[0]: 'https://fake.test/x'})
+        runner.process_post(listing[0])
+        staged = dict(runner._wave.zips)
+        assert staged and all(os.path.exists(p) for p in staged.values())
+        store.client.fail_commits = 6
+        runner._close_wave()
+        assert [item['rid'] for item in store.pending] == ['fake_x']
+        assert 'fake_x' not in store.done
+        assert not any(os.path.exists(p) for p in staged.values())
+
+    def test_discarding_a_wave_commits_nothing(self, env):
+        site, clock, make = env
+        listing = paths(1)
+        runner, store, skeb = make(listing, {listing[0]: 'https://fake.test/y'})
+        runner.process_post(listing[0])
+        runner._discard_wave()
+        assert store.client.commits == [] and 'fake_y' not in store.done

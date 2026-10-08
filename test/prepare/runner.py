@@ -1,12 +1,14 @@
 import logging
 import os
 import re
+import shutil
 import signal
+import tempfile
 import threading
 import time
 import traceback
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
 import requests
@@ -55,13 +57,30 @@ class Job:
 
 
 @dataclass
+class Wave:
+    """Results collected since the last commit: the zips already on disk and the bookkeeping that goes with them.
+
+    Nothing here is visible to the dataset or to the saved state until the wave is committed in one go.
+    """
+    dir: Optional[str] = None
+    zips: Dict[str, str] = field(default_factory=dict)          # resource id -> zip path
+    jobs: List[Tuple['Job', str, str]] = field(default_factory=list)  # (job, kind, label) of the uploaded ones
+    bytes: int = 0
+    dup: int = 0
+    gone: int = 0
+    queued: int = 0
+    opened_at: Optional[float] = None
+
+
+@dataclass
 class RunConfig:
     budget_seconds: float = 5.5 * 3600
     poll_interval: float = 600.0
     bootstrap: int = 400
     max_skeb_requests: int = 4500
-    flush_every: int = 20
-    flush_seconds: float = 120.0
+    wave_seconds: float = 180.0     # a wave is committed at the latest this long after its first result
+    wave_resources: int = 60        # ... or as soon as it holds this many resources
+    wave_bytes: float = 1024 ** 3   # ... or this many bytes of zips
     retry_batch: int = 20
     max_extra_posts: int = 100
     lease_every: float = 300.0
@@ -91,7 +110,7 @@ class Runner:
         self.discovered: List[str] = []
         self.bugs = 0
         self.stop_reason = ''
-        self._posts_since_flush = 0
+        self._wave = Wave()
 
     # ---------------------------------------------------------------- helpers
     def _count(self, site: str, status: str):
@@ -107,6 +126,8 @@ class Runner:
     # ---------------------------------------------------------------- one resource
     def _attempt(self, job: Job, workdir: str) -> Tuple[str, Optional[str]]:
         """Return ``(status, zip_path)``; status is one of ok / dup / gone / empty / deferred / retry / bug."""
+        if job.rid in self._wave.zips:
+            return 'staged', None  # the same resource linked from another post, already in the open wave
         if self.store.known(job.rid):
             return 'dup', None
         until = self.cooldown.get(job.site.NAME, 0.0)
@@ -161,69 +182,121 @@ class Runner:
             'next_try': self.clock() + delay,
         })
 
-    def _title(self, kind: str, label: str, jobs: List[Job], zips: Dict[str, str], gone: int, queued: int,
-               dup: int = 0) -> str:
-        """``[new] @user/works/12 | +2 res, 48.3 MiB (googledrive 1, imgur 1) | 37 posts waiting``"""
-        uploaded = [job for job in jobs if job.rid in zips]
-        if uploaded:
-            total = sum(os.path.getsize(path) for path in zips.values())
-            got = f'+{len(uploaded)} res, {pretty_size(total)} ({by_site(job.site.NAME for job in uploaded)})'
-        else:
-            got = '+0 res'
-        notes = [text for text in (f'{dup} already archived' if dup else '', f'{gone} gone or empty' if gone else '',
-                                   f'{queued} queued for retry' if queued else '') if text]
-        title = f'[{kind}] {label} | {got}' + (', ' + ', '.join(notes) if notes else '')
-        if kind != 'retry':
-            title += f' | {plural(len(self.store.backlog), "post")} waiting'
-        return title
+    def _wave_dir(self) -> str:
+        if self._wave.dir is None:
+            self._wave.dir = tempfile.mkdtemp(prefix='wave_')
+        return self._wave.dir
 
     def _handle_jobs(self, jobs: List[Job], kind: str, label: str):
-        """Run the jobs of one post (or one retry) and commit everything in a single commit."""
-        zips: Dict[str, str] = {}
-        done_jobs: List[Job] = []
-        gone = queued = dup = 0
-        with TemporaryDirectory() as td:
-            for job in jobs:
-                self._keep_lease()
-                status, zip_path = self._attempt(job, td)
-                self._count(job.site.NAME, 'uploaded' if status == 'ok' else status)
-                if status == 'ok':
-                    zips[job.rid] = zip_path
-                    done_jobs.append(job)
-                elif status == 'dup':
-                    dup += 1
-                    self.store.drop_pending(job.rid)
-                    self.store.done.add(job.rid)
-                elif status in ('retry', 'bug', 'deferred'):
-                    self._queue(job, status)
-                    queued += 1
-                else:
-                    self.store.drop_pending(job.rid)
-                    self.store.done.add(job.rid)
-                    if status in ('gone', 'empty'):
-                        self.store.note_dropped(job.rid, status, job.last_error, job.post)
-                        gone += 1
-            message = self._title(kind, label, jobs, zips, gone, queued, dup)
-            description = '\n'.join(f'{rid}  {pretty_size(os.path.getsize(path))}' for rid, path in zips.items())
-            try:
-                self.store.commit(zips, message, description)
-            except CommitFailed as err:
-                logging.error(str(err))
-                for job in done_jobs:
-                    job.last_error = f'commit failed: {err}'
-                    self._count(job.site.NAME, 'commit_failed')
-                    self._queue(job, 'retry')
-                try:
-                    self.store.commit({}, f'[{kind}] {label} | upload failed, {len(done_jobs)} queued for retry')
-                except CommitFailed as state_err:
-                    logging.error(f'state could not be saved either: {state_err}')
-                return
-            for job in done_jobs:
+        """Run the jobs of one post (or one retry) and add what came out of them to the open wave."""
+        wave = self._wave
+        workdir = self._wave_dir()
+        for job in jobs:
+            self._keep_lease()
+            status, zip_path = self._attempt(job, workdir)
+            if status == 'staged':
+                continue
+            self._count(job.site.NAME, 'uploaded' if status == 'ok' else status)
+            if status == 'ok':
+                wave.zips[job.rid] = zip_path
+                wave.bytes += os.path.getsize(zip_path)
+                wave.jobs.append((job, kind, label))
+            elif status == 'dup':
+                wave.dup += 1
                 self.store.drop_pending(job.rid)
                 self.store.done.add(job.rid)
-                logging.info(f'{job.rid}: uploaded')
+            elif status in ('retry', 'bug', 'deferred'):
+                self._queue(job, status)
+                wave.queued += 1
+            else:
+                self.store.drop_pending(job.rid)
+                self.store.done.add(job.rid)
+                if status in ('gone', 'empty'):
+                    self.store.note_dropped(job.rid, status, job.last_error, job.post)
+                    wave.gone += 1
+        self._maybe_close_wave()
+
+    def _wave_title(self) -> str:
+        """``[wave] +12 res, 48.3 MiB (googledrive 9, imgur 3) | new 9, retry 2, old 1 | 37 posts waiting``"""
+        wave = self._wave
+        notes = [text for text in (f'{wave.dup} already archived' if wave.dup else '',
+                                   f'{wave.gone} gone or empty' if wave.gone else '',
+                                   f'{wave.queued} queued for retry' if wave.queued else '') if text]
+        if wave.zips:
+            total = sum(os.path.getsize(path) for path in wave.zips.values())
+            kinds = ', '.join(f'{name} {count}' for name in ('new', 'retry', 'old')
+                              if (count := sum(1 for _, kind, _ in wave.jobs if kind == name)))
+            head = (f'[wave] +{len(wave.zips)} res, {pretty_size(total)} '
+                    f'({by_site(job.site.NAME for job, _, _ in wave.jobs)}) | {kinds}')
+        else:
+            head = f'[state] {plural(self._checked, "post")} checked, nothing to fetch' if self._checked \
+                else '[state] queue and cursor updated'
+        parts = [head] + ([', '.join(notes)] if notes else []) + [f'{plural(len(self.store.backlog), "post")} waiting']
+        return ' | '.join(parts)
+
+    def _reset_wave(self):
+        for path in self._wave.zips.values():
+            if os.path.exists(path):
+                os.remove(path)
+        self._wave = Wave(dir=self._wave.dir)
         self._checked = 0
-        self._posts_since_flush = 0
+
+    def _discard_wave(self):
+        """Forget the open wave without committing it (the run is ending without the lease, or is over)."""
+        if self._wave.dir is not None:
+            shutil.rmtree(self._wave.dir, ignore_errors=True)
+        self._wave = Wave()
+
+    def _maybe_close_wave(self):
+        """Commit the open wave once it is full or three minutes old. A round also closes it, see ``cycle``."""
+        wave = self._wave
+        now = self.clock()
+        if wave.opened_at is None and (wave.zips or self.store.dirty):
+            wave.opened_at = now
+        if wave.opened_at is None:
+            return
+        full = len(wave.zips) >= self.config.wave_resources or wave.bytes >= self.config.wave_bytes
+        if full or now - wave.opened_at >= self.config.wave_seconds:
+            self._close_wave()
+
+    def _close_wave(self):
+        """Commit the open wave: its zips and the state in ONE commit, then settle the jobs that went in."""
+        wave = self._wave
+        if not wave.zips and not self.store.dirty:
+            self._reset_wave()
+            return
+        description = '\n'.join(f'{job.rid}  {pretty_size(os.path.getsize(wave.zips[job.rid]))}  {kind}  {label}'
+                                for job, kind, label in wave.jobs)
+        message = self._wave_title()
+        if not wave.zips:
+            try:
+                self.store.commit({}, message)
+            except CommitFailed as err:
+                # the hub is having trouble; the state stays dirty and goes out with the next wave
+                logging.error(f'state not saved for now: {err}')
+            self._reset_wave()
+            return
+        try:
+            self.store.commit(wave.zips, message, description)
+        except CommitFailed as err:
+            # the zips did not go up, so none of their jobs is done: they all go back to the retry queue
+            logging.error(str(err))
+            for job, _, _ in wave.jobs:
+                job.last_error = f'commit failed: {err}'
+                self._count(job.site.NAME, 'commit_failed')
+                self._queue(job, 'retry')
+            failed = len(wave.jobs)
+            self._reset_wave()
+            try:
+                self.store.commit({}, f'[wave] upload failed, {plural(failed, "resource")} queued for retry')
+            except CommitFailed as state_err:
+                logging.error(f'state could not be saved either: {state_err}')
+            return
+        for job, _, _ in wave.jobs:
+            self.store.drop_pending(job.rid)
+            self.store.done.add(job.rid)
+            logging.info(f'{job.rid}: uploaded')
+        self._reset_wave()
 
     # ---------------------------------------------------------------- one post
     def process_post(self, path: str, from_listing: bool = True):
@@ -269,11 +342,7 @@ class Runner:
             self._handle_jobs(jobs, 'new' if from_listing else 'old', label)
         else:
             self._checked += 1
-            self._posts_since_flush += 1
-            idle = time.time() - self.store.last_commit_at
-            if self._posts_since_flush >= self.config.flush_every or idle >= self.config.flush_seconds:
-                self._flush()
-                self._posts_since_flush = 0
+            self._maybe_close_wave()
 
     # ---------------------------------------------------------------- linked works
     @staticmethod
@@ -302,6 +371,8 @@ class Runner:
         for item in due:
             if self._time_left() < 120:
                 break
+            if item['rid'] in self._wave.zips:
+                continue  # already in the open wave, it is committed with it
             resolved = resolve(item['url'])
             if resolved is None:
                 self.store.drop_pending(item['rid'])
@@ -397,19 +468,6 @@ class Runner:
             logging.info(f'{len(fresh)} new post(s) queued in front of {len(self.store.backlog)} waiting.')
             self.store.enqueue(fresh)
 
-    def _flush(self):
-        """Commit the bookkeeping on its own, saying what happened since the last commit."""
-        if not self.store.dirty:
-            return
-        checked, self._checked = self._checked, 0
-        waiting = plural(len(self.store.backlog), 'post')
-        what = f'{plural(checked, "post")} checked, nothing to fetch' if checked else 'queue and cursor updated'
-        try:
-            self.store.commit({}, f'[state] {what} | {waiting} waiting')
-        except CommitFailed as err:
-            # the hub is having trouble; the state stays dirty and goes out with the next commit
-            logging.error(f'state not saved for now: {err}')
-
     @staticmethod
     def _on_hard_deadline(signum, frame):
         print('::error title=hard deadline::the run is over its time limit and ends now so the next one can start',
@@ -480,7 +538,7 @@ class Runner:
         fresh_waiting = skeb_ok and not failed and bool(self.store.backlog)
         if not pending_done and not fresh_waiting:
             self.process_pending()  # nothing fresh can be fetched right now, the old failures may go ahead
-        self._flush()
+        self._close_wave()  # a round ends with a commit, so nothing waits through the sleep until the next round
         return processed
 
     def run(self):
@@ -501,12 +559,14 @@ class Runner:
                     break
                 self.stop_reason = ''
                 self.sleep(self.config.poll_interval)
-            self._flush()
+            self._close_wave()
         except LeaseLost as err:
             logging.error(str(err))
             self.stop_reason = 'lease lost'
+            self._discard_wave()
             return
         finally:
+            self._discard_wave()
             if self.config.hard_deadline:
                 self._disarm_hard_deadline()
             if self.use_lease and self.stop_reason != 'lease lost':
