@@ -270,13 +270,15 @@ def render_quarter(quarter: str, packs_by_month: Dict[str, List[Dict]], stats: D
                   or [['-', '0', '-', '-', '-']]),
            '', '## Summary by month', '']
     month_rows = []
-    for month in sorted(m for m in stats['months'] if _quarter_key(dt.datetime.strptime(m, '%Y-%m')) == quarter):
+    for month in sorted((m for m in stats['months'] if _quarter_key(dt.datetime.strptime(m, '%Y-%m')) == quarter),
+                        reverse=True):
         m = stats['months'][month]
         month_rows.append([month, str(m['packs']), f'{m["files"]:,}', human_bytes(m['bytes'])])
     out += [_table(['Month', 'Packs', 'Files', 'Size'], month_rows or [['-', '0', '0', '-']]), '',
             '## Summary by day', '']
     day_rows = []
-    for day in sorted(d for d in stats['days'] if d.startswith(quarter_months_prefix(quarter))):
+    for day in sorted((d for d in stats['days']
+                       if _quarter_key(dt.datetime.strptime(d, '%Y-%m-%d')) == quarter), reverse=True):
         d = stats['days'][day]
         day_rows.append([day, str(d['packs']), f'{d["files"]:,}', human_bytes(d['bytes'])])
     out += [_table(['Day', 'Packs', 'Files', 'Size'], day_rows or [['-', '0', '0', '-']]), '']
@@ -341,12 +343,12 @@ def render_readme(stats: Dict, quarters_written: List[str], charts: Dict[str, st
            '## Last twelve months', '', f'![months](./stats/{charts["months"]})', '',
            _table(['Month', 'Packs', 'Files', 'Size'], [
                [m, str(stats['months'][m]['packs']), f'{stats["months"][m]["files"]:,}',
-                human_bytes(stats['months'][m]['bytes'])] for m in sorted(stats['months'])[-12:]
+                human_bytes(stats['months'][m]['bytes'])] for m in sorted(stats['months'], reverse=True)[:12]
            ]), '',
            '## Last thirty days', '', f'![days](./stats/{charts["days"]})', '',
            _table(['Day', 'Packs', 'Files', 'Size'], [
                [d, str(stats['days'][d]['packs']), f'{stats["days"][d]["files"]:,}',
-                human_bytes(stats['days'][d]['bytes'])] for d in sorted(stats['days'])[-30:]
+                human_bytes(stats['days'][d]['bytes'])] for d in sorted(stats['days'], reverse=True)[:30]
            ]), '',
            '## Method', '',
            '- Files are listed from each zip\'s central directory with HTTP range requests; no pack is downloaded to '

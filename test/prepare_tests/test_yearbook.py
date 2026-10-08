@@ -149,3 +149,13 @@ class TestOrder:
         page = yb.render_quarter('2024Q2', {'2024-05': [older, newer], '2024-04': [earlier_month]}, stats)
         assert page.index('pack_20240520') < page.index('pack_20240501')  # newer pack above the older one
         assert page.index('## 2024-05') < page.index('## 2024-04')  # newer month above the older one
+
+    def test_monthly_and_daily_tables_run_newest_first(self):
+        records = [yb.summarize_pack(f'pack_2024{m:02d}01_100000_000001.zip', 1, [('a.png', 1)]) for m in (1, 3, 2)]
+        stats = yb.aggregate(records)
+        readme = yb.render_readme(stats, ['2024Q1'], {'categories': 'c.png', 'quarters': 'q.png', 'months': 'm.png',
+                                                    'days': 'd.png'})
+        assert readme.index('| 2024-03 |') < readme.index('| 2024-02 |') < readme.index('| 2024-01 |')
+        page = yb.render_quarter('2024Q1', {}, stats)
+        assert page.index('| 2024-03 |') < page.index('| 2024-01 |')
+        assert page.index('| 2024-03-01 |') < page.index('| 2024-01-01 |')
