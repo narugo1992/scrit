@@ -93,9 +93,26 @@ class DownloadInfo:
     final_url: str
 
 
+_MAX_NAME_BYTES = 200  # file systems allow 255 bytes per name; Japanese names take three bytes per character
+
+
+def _cut_bytes(text: str, limit: int) -> str:
+    """The longest prefix of ``text`` whose UTF-8 form fits in ``limit`` bytes, cut between characters."""
+    encoded = text.encode('utf-8')
+    if len(encoded) <= limit:
+        return text
+    return encoded[:limit].decode('utf-8', 'ignore')
+
+
 def safe_name(name: str, default: str = 'file') -> str:
-    """Make one path component safe to create on disk."""
+    """Make one path component safe to create on disk, and short enough for the file system (the extension is kept)."""
     name = re.sub(r'[\x00-\x1f/\\]+', '_', name or '').strip().strip('.')
+    if len(name.encode('utf-8')) > _MAX_NAME_BYTES:
+        stem, ext = os.path.splitext(name)
+        if 0 < len(ext.encode('utf-8')) <= 32:
+            name = _cut_bytes(stem, _MAX_NAME_BYTES - len(ext.encode('utf-8'))) + ext
+        else:
+            name = _cut_bytes(name, _MAX_NAME_BYTES)
     return name or default
 
 
