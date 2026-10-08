@@ -76,7 +76,8 @@ class TestCrawlerCommitMessages:
         runner.cycle()
         assert titles(store) == ['[state] 3 posts checked, nothing to fetch | 0 posts waiting']
 
-    def test_lease_commits_are_readable(self):
+    def test_lease_commits_are_readable(self, monkeypatch):
+        monkeypatch.delenv('GITHUB_RUN_ID', raising=False)  # on CI the holder is the workflow run id
         store = MemStore()
         store.acquire_lease('run-1', sleep=lambda s: None)
         store.release_lease('run-1')
