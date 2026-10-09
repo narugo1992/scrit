@@ -942,3 +942,33 @@ class TestWaves:
         runner.process_post(listing[0])
         runner._discard_wave()
         assert store.client.commits == [] and 'fake_y' not in store.done
+
+
+@pytest.mark.unittest
+class TestNoRepeatUploads:
+    def test_a_resource_archived_meanwhile_is_not_uploaded_again(self, env):
+        site, clock, make = env
+        listing = paths(1)
+        runner, store, skeb = make(listing, {listing[0]: 'https://fake.test/again'})
+        runner.process_post(listing[0])
+        staged = runner._wave.zips['fake_again']
+        assert os.path.exists(staged)
+
+        def refresh_meanwhile(index_ttl=3600.0):
+            store.archived.add('fake_again')  # a repack archived it while the wave was open
+        store.refresh = refresh_meanwhile
+        runner._close_wave()
+        assert not os.path.exists(staged)
+        assert not any('unarchived/fake_again.zip' in c['paths'] for c in store.client.commits)
+        assert 'fake_again' in store.done and store.pending == []
+        assert runner.counters.get('dup') == 1
+
+    def test_a_resource_still_missing_is_uploaded_once(self, env):
+        site, clock, make = env
+        listing = paths(1)
+        runner, store, skeb = make(listing, {listing[0]: 'https://fake.test/fresh'})
+        runner.process_post(listing[0])
+        store.refresh = lambda index_ttl=3600.0: None
+        runner._close_wave()
+        uploads = [c for c in store.client.commits if 'unarchived/fake_fresh.zip' in c['paths']]
+        assert len(uploads) == 1

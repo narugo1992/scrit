@@ -468,3 +468,31 @@ def refresh(api, repo_id: str, token: Optional[str]) -> Optional[str]:
 
 def read_members_remote(url: str, token: Optional[str], size: int) -> List[Tuple[str, int]]:
     return read_members(size, range_reader(url, token))
+
+
+# ---------------------------------------------------------------- audit
+def find_repeated_files(members_by_pack: Dict[str, List[Tuple[str, int]]]) -> List[Tuple[str, int, List[str]]]:
+    """Files with the same name and size in more than one pack: ``(name, size, [packs])``, newest pack first."""
+    where: Dict[Tuple[str, int], List[str]] = defaultdict(list)
+    for pack, members in members_by_pack.items():
+        for name, size in members:
+            where[(name, size)].append(pack)
+    repeated = [(name, size, sorted(set(packs), reverse=True)) for (name, size), packs in where.items()
+                if len(set(packs)) > 1]
+    return sorted(repeated, key=lambda item: item[2][0], reverse=True)
+
+
+def audit_recent(api, repo_id: str, token: Optional[str], days: int = 3, now: Optional[dt.datetime] = None) -> List:
+    """Report, without changing anything, the files repeated among the packs of the last ``days`` days."""
+    from huggingface_hub import hf_hub_url
+    now = now or dt.datetime.now(LOCAL_TZ)
+    cutoff = now - dt.timedelta(days=days)
+    members_by_pack: Dict[str, List[Tuple[str, int]]] = {}
+    for item in api.list_repo_tree(repo_id=repo_id, repo_type='dataset', path_in_repo='packs'):
+        name = os.path.basename(item.path)
+        stamp = pack_time(name)
+        if not name.endswith('.zip') or stamp is None or stamp < cutoff:
+            continue
+        url = hf_hub_url(repo_id=repo_id, repo_type='dataset', filename=item.path)
+        members_by_pack[name] = read_members_remote(url, token, item.size)
+    return find_repeated_files(members_by_pack)

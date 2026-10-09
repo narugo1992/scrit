@@ -159,3 +159,35 @@ class TestOrder:
         page = yb.render_quarter('2024Q1', {}, stats)
         assert page.index('| 2024-03 |') < page.index('| 2024-01 |')
         assert page.index('| 2024-03-01 |') < page.index('| 2024-01-01 |')
+
+
+@pytest.mark.unittest
+class TestRepeatAudit:
+    def test_a_file_in_two_packs_is_reported_newest_first(self):
+        packs = {
+            'pack_20261007_100000_000001.zip': [('0GRM_3_a.png', 10), ('x.png', 1)],
+            'pack_20261008_100000_000001.zip': [('0GRM_3_a.png', 10), ('y.png', 2)],
+            'pack_20261008_200000_000001.zip': [('0GRM_3_a.png', 11)],  # same name, other size: another version
+        }
+        repeated = yb.find_repeated_files(packs)
+        assert repeated == [('0GRM_3_a.png', 10, ['pack_20261008_100000_000001.zip', 'pack_20261007_100000_000001.zip'])]
+
+    def test_only_the_last_days_are_audited(self, monkeypatch):
+        class Item:
+            def __init__(self, path, size):
+                self.path, self.size = path, size
+
+        class Api:
+            def list_repo_tree(self, **kwargs):
+                return [Item('packs/pack_20261001_100000_000001.zip', 1), Item('packs/pack_20261008_100000_000001.zip', 1),
+                        Item('packs/pack_20261007_100000_000001.zip', 1)]
+        read = []
+
+        def fake_read(url, token, size):
+            read.append(url)
+            return [('same.png', 5)]
+        monkeypatch.setattr(yb, 'read_members_remote', fake_read)
+        now = dt.datetime(2026, 10, 8, 12, 0, tzinfo=yb.LOCAL_TZ)
+        repeated = yb.audit_recent(Api(), 'hk1901/fuck_the_skeb', None, days=3, now=now)
+        assert len(read) == 2 and not any('20261001' in url for url in read)
+        assert repeated == [('same.png', 5, ['pack_20261008_100000_000001.zip', 'pack_20261007_100000_000001.zip'])]

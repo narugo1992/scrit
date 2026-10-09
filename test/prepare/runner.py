@@ -259,12 +259,36 @@ class Runner:
         if full or now - wave.opened_at >= self.config.wave_seconds:
             self._close_wave()
 
+    def _drop_archived_meanwhile(self):
+        """Before the commit: reload the dedupe indexes and keep out the staged zips that are already in the dataset.
+
+        The indexes are read once an hour, so a resource archived by a repack in the meantime (a retry of a commit
+        that had in fact gone through, say) could be staged again. Such a zip is dropped here, not uploaded twice.
+        """
+        wave = self._wave
+        if not wave.zips:
+            return
+        self.store.refresh(index_ttl=0)
+        for job, kind, label in list(wave.jobs):
+            if job.rid not in self.store.archived and job.rid not in self.store.unarchived:
+                continue
+            path = wave.zips.pop(job.rid)
+            if os.path.exists(path):
+                os.remove(path)
+            wave.jobs.remove((job, kind, label))
+            wave.dup += 1
+            self.store.drop_pending(job.rid)
+            self.store.done.add(job.rid)
+            self._count(job.site.NAME, 'dup')
+            logging.warning(f'{job.rid}: already in the dataset, not uploaded again')
+
     def _close_wave(self):
         """Commit the open wave: its zips and the state in ONE commit, then settle the jobs that went in."""
         wave = self._wave
         if not wave.zips and not self.store.dirty:
             self._reset_wave()
             return
+        self._drop_archived_meanwhile()
         description = '\n'.join(f'{job.rid}  {pretty_size(os.path.getsize(wave.zips[job.rid]))}  {kind}  {label}'
                                 for job, kind, label in wave.jobs)
         message = self._wave_title()

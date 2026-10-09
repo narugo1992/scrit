@@ -286,12 +286,22 @@ def refresh_statistics() -> Optional[str]:
     published and the pages are rebuilt by the next run.
     """
     import requests
-    from .yearbook import refresh
+    from .yearbook import audit_recent, refresh
     try:
         message = refresh(hf_client, _REPOSITORY, hf_token)
     except (HfHubHTTPError, requests.RequestException, OSError, ValueError, RuntimeError):
         logging.exception('Statistics pages were not updated.')
-        return None
+        message = None
     if message:
         logging.info(message)
+    try:
+        repeated = audit_recent(hf_client, _REPOSITORY, hf_token, days=3)
+    except (HfHubHTTPError, requests.RequestException, OSError, ValueError, RuntimeError):
+        logging.exception('Repeated files were not checked.')
+        return message
+    for name, size, packs in repeated:
+        logging.warning(f'Repeated file {name!r} ({size} bytes) in {", ".join(packs)}')
+        print(f'::warning title=repeated file::{name} ({size} bytes) in {", ".join(packs)}', flush=True)
+    if not repeated:
+        logging.info('No file repeated among the packs of the last three days.')
     return message
