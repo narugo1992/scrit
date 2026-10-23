@@ -175,6 +175,44 @@ class TestDropboxUnzip:
         dropbox.download(None, 'https://www.dropbox.com/scl/fo/abc/def?rlkey=x&dl=0', str(tmp_path))
         assert sorted(os.listdir(str(tmp_path))) == ['f0.txt', 'f1.txt']
 
+    def test_long_member_names_are_shortened(self, tmp_path, monkeypatch):
+        from test.prepare.sites import dropbox
+        long_name = 'Screenshot ' + 'パウニイ' * 40 + '.png'
+        monkeypatch.setattr(dropbox, 'fetch_file',
+                            lambda fx, url, out_dir: _make_named_zip(out_dir, {f'sub/{long_name}': b'img'}))
+        dropbox.download(None, 'https://www.dropbox.com/scl/fo/abc/def?rlkey=x&dl=0', str(tmp_path))
+        files = [(d, f) for d, _, fs in os.walk(str(tmp_path)) for f in fs]
+        assert len(files) == 1
+        assert os.path.basename(files[0][0]) == 'sub'
+        assert files[0][1].endswith('.png') and len(files[0][1].encode('utf-8')) <= 200
+
+    def test_members_that_collide_after_shortening_are_all_kept(self, tmp_path, monkeypatch):
+        from test.prepare.sites import dropbox
+        names = {'a' * 250 + f'{i}.png': f'data{i}'.encode() for i in range(3)}
+        monkeypatch.setattr(dropbox, 'fetch_file', lambda fx, url, out_dir: _make_named_zip(out_dir, names))
+        dropbox.download(None, 'https://www.dropbox.com/scl/fo/abc/def?rlkey=x&dl=0', str(tmp_path))
+        contents = sorted(open(os.path.join(str(tmp_path), f), 'rb').read() for f in os.listdir(str(tmp_path)))
+        assert contents == [b'data0', b'data1', b'data2']
+
+    def test_unsafe_member_paths_stay_inside_the_directory(self, tmp_path, monkeypatch):
+        from test.prepare.sites import dropbox
+        out = tmp_path / 'out'
+        out.mkdir()
+        monkeypatch.setattr(dropbox, 'fetch_file',
+                            lambda fx, url, out_dir: _make_named_zip(out_dir, {'../../evil.txt': b'x', '/abs/ok.txt': b'y'}))
+        dropbox.download(None, 'https://www.dropbox.com/scl/fo/abc/def?rlkey=x&dl=0', str(out))
+        assert not (tmp_path / 'evil.txt').exists()
+        assert sorted(f for _, _, fs in os.walk(str(out)) for f in fs) == ['evil.txt', 'ok.txt']
+
+
+def _make_named_zip(out_dir, members):
+    import zipfile
+    path = os.path.join(out_dir, 'pack.zip')
+    with zipfile.ZipFile(path, 'w') as zf:
+        for name, data in members.items():
+            zf.writestr(name, data)
+    return path
+
 
 def _make_zip(out_dir, count):
     path = os.path.join(out_dir, 'pack.zip')

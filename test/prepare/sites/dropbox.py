@@ -1,5 +1,6 @@
 import logging
 import os
+import shutil
 import zipfile
 from typing import Optional
 from urllib.parse import urlsplit, urlencode, parse_qsl
@@ -8,7 +9,7 @@ from hbutils.system import urlsplit as hb_urlsplit
 
 from .common import fetch_file
 from ..errors import ResourceGone, UnexpectedResponse
-from ..http import Fetcher
+from ..http import Fetcher, safe_name
 
 NAME = 'dropbox'
 
@@ -40,6 +41,30 @@ def _direct_url(url: str) -> str:
     return f'https://www.dropbox.com{parsed.path}?{urlencode(query)}'
 
 
+def _free_path(path: str) -> str:
+    """Names cut to the length limit can collide, so a numbered sibling is used instead of overwriting."""
+    stem, ext = os.path.splitext(path)
+    index = 1
+    while os.path.exists(path):
+        path = f'{stem}_{index}{ext}'
+        index += 1
+    return path
+
+
+def _extract(zf: zipfile.ZipFile, out_dir: str):
+    """Unpack member by member: every path component goes through `safe_name`, which `extractall` does not do."""
+    for info in zf.infolist():
+        if info.is_dir():
+            continue
+        parts = [safe_name(part) for part in info.filename.replace('\\', '/').split('/') if part not in ('', '.', '..')]
+        if not parts:
+            continue
+        dest = os.path.join(out_dir, *parts)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with zf.open(info) as src, open(_free_path(dest), 'wb') as dst:
+            shutil.copyfileobj(src, dst)
+
+
 def download(fx: Fetcher, url: str, out_dir: str):
     try:
         target = fetch_file(fx, _direct_url(url), out_dir)
@@ -51,5 +76,5 @@ def download(fx: Fetcher, url: str, out_dir: str):
             if len(infos) > _MAX_MEMBERS or sum(item.file_size for item in infos) > _MAX_EXTRACT_BYTES:
                 logging.warning(f'{target!r} is too big to unpack ({len(infos)} members), kept as a zip.')
                 return
-            zf.extractall(out_dir)
+            _extract(zf, out_dir)
         os.remove(target)
