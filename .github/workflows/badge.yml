@@ -7,7 +7,7 @@ on:
 jobs:
   update-badges:
     name: Update Badges
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: ${{ !contains(github.event.head_commit.message, 'ci skip') && !contains(github.event.head_commit.message, 'test skip') }}
     strategy:
       matrix:
