@@ -11,6 +11,7 @@ from urllib.parse import urlsplit, urljoin
 
 import pyrfc6266
 import requests
+from pyparsing import ParseException
 from requests.adapters import HTTPAdapter
 from urllib3.connection import HTTPConnection, HTTPSConnection
 from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
@@ -128,7 +129,11 @@ def filename_from_headers(headers) -> Optional[str]:
     disposition = headers.get('Content-Disposition')
     if not disposition:
         return None
-    name = pyrfc6266.parse_filename(disposition)
+    try:
+        name = pyrfc6266.parse_filename(disposition)
+    except ParseException:
+        # e.g. an unquoted `filename=Screenshot (1).png`: the caller falls back to the name in the URL
+        return None
     return _undo_latin1(name) if name else None
 
 

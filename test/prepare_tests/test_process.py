@@ -78,6 +78,11 @@ class TestHeaders:
         assert filename_from_headers({'Content-Disposition': 'attachment; filename="plain.png"'}) == 'plain.png'
         assert filename_from_headers({}) is None
 
+    def test_unparseable_header_means_no_name(self):
+        from test.prepare.http import filename_from_headers
+        assert filename_from_headers({'Content-Disposition': 'attachment; filename=Screenshot (1).png'}) is None
+        assert filename_from_headers({'Content-Disposition': 'attachment;filename="x.png";size=(3)'}) is None
+
 
 @pytest.mark.unittest
 class TestFetcherSafety:
